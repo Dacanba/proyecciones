@@ -1,0 +1,802 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+import time
+import io
+import os
+
+def detect_candle_patterns(df):
+    patterns = []
+    for i in range(len(df)):
+        p = []
+        o, h, l, c = df['Open'].iloc[i], df['High'].iloc[i], df['Low'].iloc[i], df['Close'].iloc[i]
+        body = abs(c - o)
+        upper_shadow = h - max(o, c)
+        lower_shadow = min(o, c) - l
+        if body > 0 and lower_shadow > 2 * body and upper_shadow < body:
+            p.append("Martillo")
+        if i > 0 and o < c and df['Close'].iloc[i-1] < df['Open'].iloc[i-1] and o < df['Close'].iloc[i-1] and c > df['Open'].iloc[i-1]:
+            p.append("EnvolventeAlcista")
+        if i > 0 and o > c and df['Close'].iloc[i-1] > df['Open'].iloc[i-1] and o > df['Close'].iloc[i-1] and c < df['Open'].iloc[i-1]:
+            p.append("EnvolventeBajista")
+        patterns.append(','.join(p))
+    return patterns
+
+def add_sr_distances(df, supports, resistances):
+    def nearest(array, value):
+        arr = np.array(array)
+        return np.min(np.abs(arr - value)) if len(arr) > 0 else np.nan
+    df['dist_nearest_support'] = df['Close'].apply(lambda x: nearest(supports, x))
+    df['dist_nearest_resist'] = df['Close'].apply(lambda x: nearest(resistances, x))
+    return df
+
+def enrich_movements(data, movements_df, supports, resistances, ticker='N/A'):
+    import ta
+    from sklearn.cluster import KMeans
+    data = data.copy()
+    data['rsi'] = ta.momentum.RSIIndicator(data['Close'], window=14).rsi()
+    boll = ta.volatility.BollingerBands(data['Close'], window=20)
+    data['bollinger_high'] = boll.bollinger_hband()
+    data['bollinger_low'] = boll.bollinger_lband()
+    data['ma50'] = data['Close'].rolling(50).mean()
+    data['ma200'] = data['Close'].rolling(200).mean()
+    data['candle_pattern'] = detect_candle_patterns(data)
+    data = add_sr_distances(data, supports, resistances)
+    enriched = []
+    for idx, row in movements_df.iterrows():
+        start = data.index.get_loc(row['start_date'])
+        end = data.index.get_loc(row['end_date'])
+        context = {}
+        context['vol_prev10'] = data['Close'].iloc[max(0, start-10):start].pct_change().std()*np.sqrt(252)
+        context['vol_post10'] = data['Close'].iloc[end:end+10].pct_change().std()*np.sqrt(252)
+        context['dist_sup_start'] = data['dist_nearest_support'].iloc[start]
+        context['dist_resist_start'] = data['dist_nearest_resist'].iloc[start]
+        context['dist_sup_end'] = data['dist_nearest_support'].iloc[end]
+        context['dist_resist_end'] = data['dist_nearest_resist'].iloc[end]
+        context['duration'] = row['days']
+        context['vol_retracement'] = data['Close'].iloc[start:end+1].pct_change().std()*np.sqrt(252)
+        context['candle_end'] = data['candle_pattern'][end]
+        if idx > 0:
+            context['prev_retracement'] = movements_df.iloc[idx-1]['fibo_retracement']
+            context['gap_from_last'] = (row['start_date'] - movements_df.iloc[idx-1]['end_date']).days
+        else:
+            context['prev_retracement'] = np.nan
+            context['gap_from_last'] = np.nan
+        context['moderate_retr_before'] = (movements_df.iloc[:idx]['fibo_retracement'] > 0.382).sum() if idx > 0 else 0
+        context['relative_position'] = (start) / (len(data)-1)
+        context['market_regime'] = "alcista" if data['ma50'].iloc[start] > data['ma200'].iloc[start] else "bajista"
+        context['ticker'] = ticker
+        context['rsi_at_reversal'] = data['rsi'].iloc[end]
+        context['bollinger_h_at_reversal'] = data['bollinger_high'].iloc[end]
+        context['bollinger_l_at_reversal'] = data['bollinger_low'].iloc[end]
+        if start > 0:
+            gap = abs(data['Open'].iloc[start] - data['Close'].iloc[start-1]) / data['Close'].iloc[start-1]
+            context['gap_at_start'] = gap
+        else:
+            context['gap_at_start'] = np.nan
+        context['news_event'] = None
+        enriched.append(context)
+    enriched_df = pd.DataFrame(enriched, index=movements_df.index)
+    full_df = pd.concat([movements_df, enriched_df], axis=1)
+    features = ['duration', 'vol_retracement', 'rsi_at_reversal', 'relative_position']
+    X = full_df[features].fillna(0).values
+    if len(full_df) >= 3:
+        kmeans = KMeans(n_clusters=3, n_init=10, random_state=1).fit(X)
+        full_df['cluster'] = kmeans.labels_
+    else:
+        full_df['cluster'] = 0
+    return full_df
+
+def overlay_trajectories(movements_df, data):
+    plt.figure(figsize=(10,6))
+    for idx, row in movements_df.iterrows():
+        try:
+            start = data.index.get_loc(row['start_date'])
+            end = data.index.get_loc(row['end_date'])
+            traj = data['Close'].iloc[start:end+1].values
+            plt.plot(np.arange(len(traj)), traj / traj[0] * 100, alpha=0.5)
+        except Exception:
+            continue
+    plt.xlabel('Días desde inicio movimiento')
+    plt.ylabel('Precio normalizado (%)')
+    plt.title('Overlay trayectorias similares')
+    plt.show()
+
+plt.style.use('ggplot')
+
+REFERENCE_ASSETS = {
+    'SPX500': '^GSPC',
+    'Nasdaq': '^IXIC',
+    'DowJones': '^DJI',
+    'Oro': 'GC=F',
+    'Petroleo': 'CL=F',
+    'Bitcoin': 'BTC-USD',
+    'VIX': '^VIX',
+    'USDollar': 'DX-Y.NYB'
+}
+
+FIBO_RANGES = [
+    (0.0, 0.236, "0-23.6%"),
+    (0.236, 0.382, "23.6-38.2%"),
+    (0.382, 0.5, "38.2-50.0%"),
+    (0.5, 0.618, "50.0-61.8%"),
+    (0.618, 0.786, "61.8-78.6%"),
+    (0.786, np.inf, ">78.6%")
+]
+
+def df_make_dates_excel_friendly(df):
+    df = df.copy()
+    for col in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            df[col] = pd.to_datetime(df[col]).dt.strftime('%Y-%m-%d')
+    return df
+
+def download_data(ticker, max_lookback_days):
+    end_date = datetime.today()
+    start_date = end_date - timedelta(days=max_lookback_days)
+    for attempt in range(3):
+        try:
+            data = yf.Ticker(ticker).history(
+                start=start_date, end=end_date, interval='1d', actions=False
+            )
+            if not data.empty:
+                return data
+            for suffix in ['', '-USD', '.SA', '.TO', '.AX', '.L', '.NS']:
+                try:
+                    data = yf.Ticker(ticker + suffix).history(
+                        start=start_date, end=end_date, interval='1d', actions=False
+                    )
+                    if not data.empty:
+                        print(f"Usando símbolo alternativo: {ticker + suffix}")
+                        return data
+                except:
+                    continue
+            data = yf.download(ticker, start=start_date, end=end_date, progress=False, actions=False)
+            if not data.empty:
+                return data
+        except Exception as e:
+            print(f"Intento {attempt+1} fallido. Reintentando...")
+            time.sleep(2)
+    return pd.DataFrame()
+
+def detect_sr(data, window=10, min_touches=2, tolerance=0.01, timeframe="D"):
+    df = data.copy()
+    if timeframe == "W":
+        df = df.resample('W').last()
+    elif timeframe == "M":
+        df = df.resample('ME').last()
+    prices = df['Close']
+    min_idx = (prices.rolling(window, center=True).min() == prices).dropna()
+    max_idx = (prices.rolling(window, center=True).max() == prices).dropna()
+    supports = prices[min_idx].dropna().round(2).unique().tolist()
+    resistances = prices[max_idx].dropna().round(2).unique().tolist()
+    return supports, resistances
+
+def nearest_fibo_level(pct_retracement, levels=[0.236, 0.382, 0.5, 0.618, 0.786]):
+    if pct_retracement > 0.786:
+        return None
+    diffs = [abs(pct_retracement - l) for l in levels]
+    idx = np.argmin(diffs)
+    return levels[idx]
+
+def rango_fibo(valor):
+    for low, high, label in FIBO_RANGES:
+        if low <= valor < high:
+            return label
+    return None
+
+def analyze_historical_movements(data, start_price, target_price, similarity_threshold=0.05, supports=None, resistances=None):
+    close_prices = data['Close'].values
+    movements = []
+    max_days_to_target = 60
+    i = 0
+    while i < len(close_prices):
+        found = False
+        for window in range(3, max_days_to_target + 1):
+            if i + window >= len(close_prices):
+                continue
+            s = close_prices[i]
+            e = close_prices[i + window]
+            pct_move = (e - s) / s
+            required_pct = (target_price - start_price) / start_price
+            if abs(abs(pct_move) - abs(required_pct)) > similarity_threshold:
+                continue
+            journey = close_prices[i:i+window+1]
+            if pct_move > 0:
+                journey_max = np.maximum.accumulate(journey)
+                drawdowns = (journey_max - journey) / (journey_max - journey[0] + 1e-8)
+                retracement = np.max(drawdowns)
+            else:
+                journey_min = np.minimum.accumulate(journey)
+                drawups = (journey - journey_min) / (journey[0] - journey_min + 1e-8)
+                retracement = np.max(drawups)
+            retracement = max(0, min(retracement, 10))
+            rango_hit = rango_fibo(retracement)
+            fibo_hit = nearest_fibo_level(retracement)
+            s_close = journey[0]
+            e_close = journey[-1]
+            def get_nearest(value, levels):
+                if not levels:
+                    return None, False
+                arr = np.array(levels)
+                idx = np.argmin(np.abs(arr - value))
+                nearest = arr[idx]
+                is_near = abs(value - nearest) < 0.01 * value
+                return nearest if is_near else None, is_near
+            s_support_val, s_near_supp = get_nearest(s_close, supports)
+            s_resist_val, s_near_res = get_nearest(s_close, resistances)
+            e_support_val, e_near_supp = get_nearest(e_close, supports)
+            e_resist_val, e_near_res = get_nearest(e_close, resistances)
+            daily_returns = np.diff(journey) / journey[:-1]
+            volatility = np.std(daily_returns) * np.sqrt(252) if len(daily_returns) > 1 else 0
+            movements.append({
+                'start_date': data.index[i],
+                'end_date': data.index[i + window],
+                'days': window,
+                'start_price': s_close,
+                'end_price': e_close,
+                'pct_change': pct_move * 100,
+                'fibo_retracement': retracement,
+                'fibo_hit': fibo_hit,
+                'fibo_range': rango_hit,
+                'volatility': volatility,
+                'type': 'Alcista' if pct_move > 0 else 'Bajista',
+                'start_near_support': s_near_supp,
+                'start_support_value': s_support_val if s_near_supp else "N/A",
+                'start_near_resistance': s_near_res,
+                'start_resistance_value': s_resist_val if s_near_res else "N/A",
+                'end_near_support': e_near_supp,
+                'end_support_value': e_support_val if e_near_supp else "N/A",
+                'end_near_resistance': e_near_res,
+                'end_resistance_value': e_resist_val if e_near_res else "N/A"
+            })
+            i += window
+            found = True
+            break
+        if not found:
+            i += 1
+    return pd.DataFrame(movements)
+
+def summarize_fibo_levels(df):
+    fibo_levels = [0.236, 0.382, 0.5, 0.618, 0.786]
+    level_labels = {0.236: "23.6%", 0.382: "38.2%", 0.5: "50.0%", 0.618: "61.8%", 0.786: "78.6%", None: ">78.6%"}
+    summary = []
+    total = len(df)
+    if total == 0:
+        return pd.DataFrame(columns=["Nivel Fibo", "Cantidad", "Porcentaje"])
+    for lev in fibo_levels:
+        count = (df['fibo_hit'] == lev).sum()
+        summary.append({
+            "Nivel Fibo": level_labels[lev],
+            "Cantidad": count,
+            "Porcentaje": 100*count/total if total > 0 else 0
+        })
+    count_sup = (df['fibo_hit'].isnull() & (df['fibo_retracement'] > 0.786)).sum()
+    if count_sup > 0:
+        summary.append({
+            "Nivel Fibo": level_labels[None],
+            "Cantidad": count_sup,
+            "Porcentaje": 100*count_sup/total if total > 0 else 0
+        })
+    max_count = max(summary, key=lambda x: x["Cantidad"])["Cantidad"] if summary else 0
+    most_frequent = [x for x in summary if x["Cantidad"] == max_count]
+    if most_frequent:
+        summary.append({
+            "Nivel Fibo": "Más Frecuente",
+            "Cantidad": most_frequent[0]["Cantidad"],
+            "Porcentaje": most_frequent[0]["Porcentaje"]
+        })
+    if "fibo_range" in df.columns:
+        total_mov = len(df)
+        for _, _, label in FIBO_RANGES:
+            count = (df['fibo_range'] == label).sum()
+            summary.append({
+                "Nivel Fibo": f"Rango {label}",
+                "Cantidad": count,
+                "Porcentaje": 100*count/total_mov if total_mov > 0 else 0
+            })
+    return pd.DataFrame(summary)
+
+# --- NUEVAS FUNCIONES PARA EL SPLIT DE SUBIDAS Y BAJADAS Y PROYECCIONES SEPARADAS ---
+
+def split_movements_by_type(historical_movements):
+    alcistas = historical_movements[historical_movements['type'] == 'Alcista'].copy()
+    bajistas = historical_movements[historical_movements['type'] == 'Bajista'].copy()
+    return alcistas, bajistas
+
+def summarize_fibo_levels_by_type(historical_movements):
+    alcistas, bajistas = split_movements_by_type(historical_movements)
+    resumen_alcistas = summarize_fibo_levels(alcistas)
+    resumen_bajistas = summarize_fibo_levels(bajistas)
+    resumen_total = summarize_fibo_levels(historical_movements)
+    return resumen_alcistas, resumen_bajistas, resumen_total
+
+def generate_and_plot_projections_split(historical_movements, start_price, n_days, target_price, ticker, fibo_level=None, sr_supports=None, sr_resistances=None):
+    alcistas, bajistas = split_movements_by_type(historical_movements)
+    results = {}
+    if not alcistas.empty:
+        proj_alcista = generate_price_projections(alcistas, start_price, n_days)
+        img_alcista = plot_projection(proj_alcista, start_price, target_price, ticker + " (Subidas)", fibo_level, sr_supports, sr_resistances)
+        results['alcistas'] = {'projections': proj_alcista, 'img': img_alcista}
+    if not bajistas.empty:
+        proj_bajista = generate_price_projections(bajistas, start_price, n_days)
+        img_bajista = plot_projection(proj_bajista, start_price, target_price, ticker + " (Bajadas)", fibo_level, sr_supports, sr_resistances)
+        results['bajistas'] = {'projections': proj_bajista, 'img': img_bajista}
+    plt.figure(figsize=(14,7))
+    if 'alcistas' in results:
+        percentiles = results['alcistas']['projections']['percentiles']
+        plt.plot(percentiles.index, percentiles['percentil_50'], label='Mediana Subidas', color='green')
+        plt.fill_between(percentiles.index, percentiles['percentil_25'], percentiles['percentil_75'], alpha=0.2, color='green')
+    if 'bajistas' in results:
+        percentiles = results['bajistas']['projections']['percentiles']
+        plt.plot(percentiles.index, percentiles['percentil_50'], label='Mediana Bajadas', color='red')
+        plt.fill_between(percentiles.index, percentiles['percentil_25'], percentiles['percentil_75'], alpha=0.2, color='red')
+    plt.axhline(y=start_price, color='black', linestyle='--', linewidth=1.5, label='Precio inicial')
+    plt.axhline(y=target_price, color='blue', linestyle='--', linewidth=1.5, label='Precio objetivo')
+    if fibo_level is not None:
+        move_total = target_price - start_price
+        price_fibo = start_price - move_total * fibo_level if move_total > 0 else start_price + abs(move_total) * fibo_level
+        plt.axhline(y=price_fibo, color='orange', linestyle='-.', linewidth=2, label=f'Retroceso Fibo {fibo_level*100:.1f}%')
+    plt.title(f"Proyección combinada de {ticker}: Subidas vs Bajadas")
+    plt.xlabel('Días')
+    plt.ylabel('Precio ($)')
+    plt.legend(loc='upper left')
+    plt.grid(True, alpha=0.3)
+    img_buffer = io.BytesIO()
+    plt.savefig(img_buffer, format='png', dpi=150, bbox_inches='tight')
+    img_buffer.seek(0)
+    plt.close()
+    results['resumen'] = {'img': img_buffer}
+    return results
+
+def generate_price_projections(historical_movements, start_price, n_days=30, n_simulations=1000):
+    if historical_movements.empty:
+        return None
+    historical_movements = historical_movements.copy()
+    historical_movements['daily_pct'] = historical_movements['pct_change'] / (100 * historical_movements['days'])
+    simulations = []
+    for _ in range(n_simulations):
+        mov = historical_movements.sample(1, weights=1/historical_movements['days']).iloc[0]
+        days = min(mov['days'], n_days)
+        daily_returns = np.random.normal(
+            loc=mov['daily_pct'],
+            scale=mov['volatility']/np.sqrt(252),
+            size=days
+        )
+        prices = start_price * (1 + daily_returns).cumprod()
+        simulations.append(prices)
+    projection_df = pd.DataFrame(simulations).T
+    projection_df.index.name = 'Día'
+    percentiles = pd.DataFrame({
+        'percentil_5': projection_df.quantile(0.05, axis=1),
+        'percentil_25': projection_df.quantile(0.25, axis=1),
+        'percentil_50': projection_df.quantile(0.5, axis=1),
+        'percentil_75': projection_df.quantile(0.75, axis=1),
+        'percentil_95': projection_df.quantile(0.95, axis=1)
+    })
+    return {
+        'simulations': projection_df,
+        'percentiles': percentiles,
+        'historical_movements_used': historical_movements
+    }
+
+def plot_projection(
+    projection_data, start_price, target_price, ticker, 
+    fibo_level=None, sr_supports=None, sr_resistances=None
+):
+    if not projection_data:
+        return None
+    percentiles = projection_data['percentiles']
+    fig = plt.figure(figsize=(14, 7), constrained_layout=True)
+    plt.fill_between(
+        percentiles.index,
+        percentiles['percentil_5'],
+        percentiles['percentil_95'],
+        color='skyblue',
+        alpha=0.3,
+        label='Rango 5-95%'
+    )
+    plt.fill_between(
+        percentiles.index,
+        percentiles['percentil_25'],
+        percentiles['percentil_75'],
+        color='dodgerblue',
+        alpha=0.4,
+        label='Rango intercuartílico (25-75%)'
+    )
+    plt.plot(
+        percentiles.index,
+        percentiles['percentil_50'],
+        color='navy',
+        linewidth=2,
+        label='Mediana'
+    )
+    plt.axhline(
+        y=start_price,
+        color='black',
+        linestyle='--',
+        linewidth=1.5,
+        label='Precio inicial'
+    )
+    plt.axhline(
+        y=target_price,
+        color='green' if target_price > start_price else 'red',
+        linestyle='--',
+        linewidth=1.5,
+        label='Precio objetivo'
+    )
+    if fibo_level is not None:
+        move_total = target_price - start_price
+        price_fibo = start_price - move_total * fibo_level if move_total > 0 else start_price + abs(move_total) * fibo_level
+        plt.axhline(
+            y=price_fibo,
+            color='orange',
+            linestyle='-.',
+            linewidth=2,
+            label=f'Retroceso Fibo {fibo_level*100:.1f}%'
+        )
+    xmax = percentiles.index.max()
+    if sr_supports:
+        for i, s in enumerate(sr_supports):
+            plt.axhline(
+                y=s,
+                color='limegreen',
+                linestyle=':',
+                linewidth=1.2,
+                alpha=0.85,
+                label='Soporte' if i == 0 else None
+            )
+            plt.text(
+                xmax, s, f'{s:.2f}', va='center', ha='left', color='green', fontsize=9, backgroundcolor='white'
+            )
+    if sr_resistances:
+        for i, r in enumerate(sr_resistances):
+            plt.axhline(
+                y=r,
+                color='crimson',
+                linestyle='--',
+                linewidth=1.2,
+                alpha=0.85,
+                label='Resistencia' if i == 0 else None
+            )
+            plt.text(
+                xmax, r, f'{r:.2f}', va='center', ha='left', color='crimson', fontsize=9, backgroundcolor='white'
+            )
+    plt.title(f"Proyección de {ticker} basada en patrones históricos")
+    plt.xlabel('Días')
+    plt.ylabel('Precio ($)')
+    plt.legend(loc='upper left', bbox_to_anchor=(1, 1))
+    plt.grid(True, alpha=0.3)
+    img_buffer = io.BytesIO()
+    plt.savefig(img_buffer, format='png', dpi=150, bbox_inches='tight')
+    img_buffer.seek(0)
+    plt.close()
+    return img_buffer
+
+def plot_summary_journey(
+    start_price, target_price, days_avg, fibo_level, sr_supports, sr_resistances, ticker, 
+    fibo_retracement_avg=None, days_to_fibo=None, days_fibo_to_target=None
+):
+    move_total = target_price - start_price
+    price_fibo = start_price - move_total * fibo_level if move_total > 0 else start_price + abs(move_total) * fibo_level
+    if days_to_fibo is None or days_fibo_to_target is None:
+        days_to_fibo = int(days_avg * 0.33)
+        days_fibo_to_target = days_avg - days_to_fibo
+    xs = [0, days_to_fibo, days_to_fibo + days_fibo_to_target]
+    ys = [start_price, price_fibo, target_price]
+    plt.figure(figsize=(14,7))
+    plt.plot(xs, ys, marker="o", linewidth=2.5, color="royalblue", label="Trayectoria idealizada")
+    plt.scatter(xs, ys, s=120, color=["black", "orange", "green"], zorder=5)
+    plt.text(xs[0], ys[0], f"Precio actual\n${start_price:,.0f}", va="bottom", ha="left", fontsize=11)
+    plt.text(xs[1], ys[1], f"Fibo {fibo_level*100:.1f}%\n${price_fibo:,.0f}", va="top", ha="center", fontsize=11, color="orange")
+    plt.text(xs[2], ys[2], f"Objetivo\n${target_price:,.0f}", va="bottom", ha="right", fontsize=11, color="green")
+    xmax = max(xs)
+    if sr_supports:
+        for s in sr_supports:
+            plt.axhline(s, color="lime", linestyle=":", alpha=0.7, lw=1.2, label="Soporte" if s==sr_supports[0] else None)
+            plt.text(xmax, s, f"{s:.2f}", va="center", ha="left", color="green", fontsize=9, backgroundcolor="white")
+    if sr_resistances:
+        for r in sr_resistances:
+            plt.axhline(r, color="crimson", linestyle="--", alpha=0.7, lw=1.2, label="Resistencia" if r==sr_resistances[0] else None)
+            plt.text(xmax, r, f"{r:.2f}", va="center", ha="left", color="crimson", fontsize=9, backgroundcolor="white")
+    plt.title(f"Recorrido típico de {ticker} según historia\n(Incluye retroceso Fibo y niveles SR)")
+    plt.xlabel("Días transcurridos")
+    plt.ylabel("Precio")
+    plt.legend(loc="best")
+    plt.grid(True, alpha=0.25)
+    plt.tight_layout()
+    img_buffer = io.BytesIO()
+    plt.savefig(img_buffer, format='png', dpi=150, bbox_inches='tight')
+    img_buffer.seek(0)
+    plt.close()
+    return img_buffer
+
+def build_correlation_summary(movement_comparison, ticker):
+    ref_assets = [col[len('Cambio % '):] for col in movement_comparison.columns if col.startswith('Cambio % ') and col != f'Cambio % {ticker}']
+    ref_assets = sorted(set(ref_assets))
+    row_change = {}
+    row_var = {}
+    row_corr = {}
+    row_dir = {}
+    for asset in ref_assets:
+        change_col = f"Cambio % {asset}"
+        corr_col = f'Correlación con {asset}'
+        avg_change = movement_comparison[change_col].mean() if change_col in movement_comparison else np.nan
+        var_change = movement_comparison[change_col].var() if change_col in movement_comparison else np.nan
+        avg_corr = movement_comparison[corr_col].mean() if corr_col in movement_comparison else np.nan
+        if corr_col in movement_comparison:
+            n_pos = (movement_comparison[corr_col] > 0).sum()
+            n_total = movement_comparison[corr_col].count()
+            percent_pos = 100*n_pos/n_total if n_total > 0 else np.nan
+        else:
+            percent_pos = np.nan
+        row_change[asset] = avg_change
+        row_var[asset] = var_change
+        row_corr[asset] = avg_corr
+        row_dir[asset] = percent_pos
+    df_summary = pd.DataFrame([
+        ["Cambio % promedio"] + [row_change[a] for a in ref_assets],
+        ["Varianza %"] + [row_var[a] for a in ref_assets],
+        ["Correlación promedio"] + [row_corr[a] for a in ref_assets],
+        ["% veces positiva"] + [row_dir[a] for a in ref_assets],
+    ], columns=["Métrica"] + ref_assets)
+    df_summary = df_summary.replace([np.nan, np.inf, -np.inf], "N/A")
+    return df_summary
+
+def build_movimientos_summary(df):
+    def calc_stats(sub):
+        count = len(sub)
+        dias_prom = sub['days'].mean() if count else "N/A"
+        retro_prom = sub['fibo_retracement'].mean() * 100 if count else "N/A"
+        contra_tend = (sub['fibo_retracement'] > 0.1).mean() * 100 if count else "N/A"
+        drawdown_prom = sub['fibo_retracement'].max() * 100 if count else "N/A"
+        tasa_exito = 100.0  # Puedes ajustar esto para una tasa de éxito real si lo deseas
+        volatilidad_prom = sub['volatility'].mean() * 100 if count else "N/A"
+        return [
+            count,
+            dias_prom,
+            retro_prom,
+            contra_tend,
+            drawdown_prom,
+            tasa_exito,
+            volatilidad_prom
+        ]
+    rows = []
+    rows.append(['Alcistas'] + calc_stats(df[df['type'] == 'Alcista']))
+    rows.append(['Bajistas'] + calc_stats(df[df['type'] == 'Bajista']))
+    rows.append(['Combinados'] + calc_stats(df))
+    rows.append(['Retroceso Significativo'] + calc_stats(df[df['fibo_retracement'] > 0.2]))
+    resumen_df = pd.DataFrame(
+        rows,
+        columns=[
+            'Categoría',
+            'Cantidad',
+            'Días Promedio',
+            'Retroceso Previo Promedio (%)',
+            'Contra Tendencia (%)',
+            'Drawdown Máximo Promedio (%)',
+            'Tasa de Éxito (%)',
+            'Volatilidad Promedio'
+        ]
+    )
+    return resumen_df.replace([float('nan'), float('inf'), float('-inf')], "N/A")
+
+
+def analyze_price_journey(ticker, start_price, target_price, max_lookback_days=365, similarity_threshold=0.05):
+    data = download_data(ticker, max_lookback_days)
+    if data.empty:
+        print(f"No se encontraron datos para {ticker}")
+        return None
+    if 'Close' not in data.columns:
+        if 'Adj Close' in data.columns:
+            data['Close'] = data['Adj Close']
+        else:
+            print("No hay columna 'Close' ni 'Adj Close'.")
+            return None
+    supports_w, resistances_w = detect_sr(data, window=5, min_touches=2, tolerance=0.01, timeframe="W")
+    supports_m, resistances_m = detect_sr(data, window=2, min_touches=2, tolerance=0.015, timeframe="M")
+    supports_total = supports_w + supports_m
+    resistances_total = resistances_w + resistances_m
+    historical_movements = analyze_historical_movements(
+        data, start_price, target_price, similarity_threshold,
+        supports=supports_total, resistances=resistances_total
+    )
+    if historical_movements.empty:
+        print("No se encontraron movimientos históricos similares")
+        return None
+
+    # --- SOLO USAR EL TIPO DE MOVIMIENTO QUE COINCIDE CON LA TENDENCIA PRINCIPAL ---
+    if target_price > start_price:
+        movs = historical_movements[historical_movements['type'] == 'Alcista']
+    else:
+        movs = historical_movements[historical_movements['type'] == 'Bajista']
+    if len(movs) < 2:
+        movs = historical_movements
+
+    fibo_summary_alc, fibo_summary_baj, fibo_summary_total = summarize_fibo_levels_by_type(historical_movements)
+    move_total = target_price - start_price
+    fib_levels = {
+        'Fib_0.236': round(start_price - move_total * 0.236 if move_total > 0 else start_price + abs(move_total) * 0.236, 2),
+        'Fib_0.382': round(start_price - move_total * 0.382 if move_total > 0 else start_price + abs(move_total) * 0.382, 2),
+        'Fib_0.5':   round(start_price - move_total * 0.5   if move_total > 0 else start_price + abs(move_total) * 0.5, 2),
+        'Fib_0.618': round(start_price - move_total * 0.618 if move_total > 0 else start_price + abs(move_total) * 0.618, 2),
+        'Fib_0.786': round(start_price - move_total * 0.786 if move_total > 0 else start_price + abs(move_total) * 0.786, 2),
+    }
+    rango_mas_frecuente = None
+    if "fibo_range" in movs.columns:
+        counts = movs["fibo_range"].value_counts()
+        if not counts.empty:
+            rango_mas_frecuente = counts.idxmax()
+    ref_data = {}
+    for asset_name, asset_ticker in REFERENCE_ASSETS.items():
+        print(f"Descargando datos de referencia para {asset_name}...")
+        try:
+            asset_history = download_data(asset_ticker, max_lookback_days)
+            if not asset_history.empty and 'Close' in asset_history.columns:
+                aligned = data[['Close']].join(
+                    asset_history['Close'].rename(asset_name),
+                    how='left'
+                )
+                ref_data[asset_name] = aligned[asset_name].dropna()
+        except Exception as e:
+            print(f"Error procesando {asset_name}: {str(e)}")
+            continue
+    movement_details = []
+    all_corr_cols = []
+    for _, mov in historical_movements.iterrows():
+        mov_info = {
+            'Fecha Inicio': mov['start_date'],
+            'Fecha Fin': mov['end_date'],
+            'Días': mov['days'],
+            f'Cambio % {ticker}': mov['pct_change'],
+            'Tipo Movimiento': mov['type'],
+            'Fibo Range': mov.get('fibo_range', None)
+        }
+        for asset_name, asset_prices in ref_data.items():
+            change_col = f'Cambio % {asset_name}'
+            corr_col = f'Correlación con {asset_name}'
+            all_corr_cols += [change_col, corr_col]
+            try:
+                mask = (asset_prices.index >= mov['start_date']) & (asset_prices.index <= mov['end_date'])
+                asset_period = asset_prices[mask]
+                if len(asset_period) > 1:
+                    aligned_prices = data['Close'].reindex(asset_prices.index)[mask]
+                    valid_mask = ~np.isnan(asset_period) & ~np.isnan(aligned_prices)
+                    if sum(valid_mask) > 1:
+                        start_price_ref = asset_period[valid_mask].iloc[0]
+                        end_price_ref = asset_period[valid_mask].iloc[-1]
+                        pct_change_ref = (end_price_ref - start_price_ref) / start_price_ref * 100
+                        mov_info[change_col] = pct_change_ref
+                        if len(asset_period[valid_mask]) == len(aligned_prices[valid_mask]):
+                            correlation = np.corrcoef(aligned_prices[valid_mask], asset_period[valid_mask])[0, 1]
+                            mov_info[corr_col] = correlation
+            except Exception as e:
+                print(f"Error calculando correlación con {asset_name}: {str(e)}")
+                continue
+        movement_details.append(mov_info)
+    all_corr_cols = list(sorted(set(all_corr_cols)))
+    movement_comparison = pd.DataFrame(movement_details)
+    for col in all_corr_cols:
+        if col not in movement_comparison.columns:
+            movement_comparison[col] = np.nan
+    statistics = movs.describe().T
+    days_avg = int(movs['days'].mean())
+    fibo_level = movs['fibo_hit'].mode().iloc[0] if not movs['fibo_hit'].empty else 0.382
+    fibo_retracement_avg = movs['fibo_retracement'].mean()
+    days_to_fibo = int(days_avg * 0.33)
+    days_fibo_to_target = days_avg - days_to_fibo
+    sr_supports = sorted([s for s in supports_total if s < start_price], reverse=True)[:3]
+    sr_resistances = sorted([r for r in resistances_total if r > start_price])[:3]
+    proy_split = generate_and_plot_projections_split(
+        historical_movements, start_price, 30, target_price, ticker, 
+        fibo_level=fibo_level, sr_supports=sr_supports, sr_resistances=sr_resistances
+    )
+    projections = generate_price_projections(movs, start_price)
+    projection_img = plot_projection(
+        projections, start_price, target_price, ticker, 
+        fibo_level=fibo_level, 
+        sr_supports=sr_supports, 
+        sr_resistances=sr_resistances
+    ) if projections else None
+    img_summary = plot_summary_journey(
+        start_price, target_price, days_avg, fibo_level, sr_supports, sr_resistances, ticker,
+        fibo_retracement_avg, days_to_fibo, days_fibo_to_target
+    )
+    results = {
+        'ticker': ticker,
+        'start_price': start_price,
+        'target_price': target_price,
+        'data_period': f"{data.index[0].date()} a {data.index[-1].date()}",
+        'supports_w': supports_w,
+        'resistances_w': resistances_w,
+        'supports_m': supports_m,
+        'resistances_m': resistances_m,
+        'historical_movements': historical_movements,
+        'fibo_summary_total': fibo_summary_total,
+        'fibo_summary_alcistas': fibo_summary_alc,
+        'fibo_summary_bajistas': fibo_summary_baj,
+        'movement_comparison': movement_comparison,
+        'statistics': statistics,
+        'projections': projections,
+        'projection_img': projection_img,
+        'img_summary': img_summary,
+        'Fib_0.236': fib_levels['Fib_0.236'],
+        'Fib_0.382': fib_levels['Fib_0.382'],
+        'Fib_0.5':   fib_levels['Fib_0.5'],
+        'Fib_0.618': fib_levels['Fib_0.618'],
+        'Fib_0.786': fib_levels['Fib_0.786'],
+        'Rango_Fibo_Mas_Frecuente': rango_mas_frecuente,
+        'proy_split': proy_split
+    }
+    return results
+
+import os
+from datetime import datetime
+# ... [todas las funciones y definiciones previas sin cambios] ...
+
+# ... [todas las funciones y definiciones previas sin cambios] ...
+
+def save_to_excel_xlsxwriter(results, output_path):
+    import xlsxwriter
+    import os
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
+        df = results['historical_movements'].copy()
+        df = df_make_dates_excel_friendly(df)
+        df.to_excel(writer, sheet_name='Movimientos', index=False)
+        # Agregar hoja de resumen de movimientos
+        resumen_mov = build_movimientos_summary(results['historical_movements'])
+        resumen_mov.to_excel(writer, sheet_name='Resumen Movimientos', index=False)
+        if results.get('fibo_summary_total') is not None:
+            results['fibo_summary_total'].to_excel(writer, sheet_name='FiboResumenTotal', index=False)
+        if results.get('fibo_summary_alcistas') is not None:
+            results['fibo_summary_alcistas'].to_excel(writer, sheet_name='FiboResumenAlcistas', index=False)
+        if results.get('fibo_summary_bajistas') is not None:
+            results['fibo_summary_bajistas'].to_excel(writer, sheet_name='FiboResumenBajistas', index=False)
+        if results.get('statistics') is not None:
+            results['statistics'].to_excel(writer, sheet_name='Estadisticas')
+        if results.get('movement_comparison') is not None:
+            df_mov = df_make_dates_excel_friendly(results['movement_comparison'])
+            df_mov.to_excel(writer, sheet_name='Comparacion', index=False)
+        workbook  = writer.book
+        if results.get('img_summary') is not None:
+            worksheet = workbook.add_worksheet('ResumenGrafico')
+            worksheet.insert_image('B2', 'img_summary.png', {'image_data': results['img_summary']})
+        if results.get('projection_img') is not None:
+            worksheet = workbook.add_worksheet('Proyeccion')
+            worksheet.insert_image('B2', 'projection_img.png', {'image_data': results['projection_img']})
+        if results.get('proy_split') and 'resumen' in results['proy_split']:
+            worksheet = workbook.add_worksheet('ProySplit')
+            worksheet.insert_image('B2', 'proy_split.png', {'image_data': results['proy_split']['resumen']['img']})
+
+def main():
+    ticker = input("Ticker a analizar: ").strip()
+    start_price = float(input("Precio inicial: "))
+    target_price = float(input("Precio objetivo: "))
+    lookback_str = input("¿Cuántos días de historia analizar? [por defecto 365]: ").strip()
+    lookback = int(lookback_str) if lookback_str else 365
+    results = analyze_price_journey(ticker, start_price, target_price, max_lookback_days=lookback)
+    if results is None:
+        print("No hay resultados para mostrar.")
+        return
+    print("Resumen de retrocesos Fibo (total):\n", results['fibo_summary_total'])
+    print("Resumen de retrocesos Fibo (alcistas):\n", results['fibo_summary_alcistas'])
+    print("Resumen de retrocesos Fibo (bajistas):\n", results['fibo_summary_bajistas'])
+    print("Estadísticas básicas:\n", results['statistics'])
+    print("Movimientos históricos encontrados:", len(results['historical_movements']))
+    print("Rango Fibo más frecuente:", results['Rango_Fibo_Mas_Frecuente'])
+    save_xlsx = input("¿Guardar resultados a Excel? (s/n): ").strip().lower()
+    if save_xlsx == 's':
+        from datetime import datetime
+        now = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = "proyecciones"
+        filename = f"{ticker}_{now}.xlsx"
+        output_path = os.path.join(output_dir, filename)
+        save_to_excel_xlsxwriter(results, output_path)
+        print(f"Archivo guardado en {output_path}")
+    print("Análisis finalizado.")
+
+if __name__ == "__main__":
+    main()
