@@ -1,0 +1,2019 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
+import glob
+import os
+import warnings
+from datetime import datetime, timedelta
+from scipy.stats import gaussian_kde, trim_mean
+from scipy.signal import argrelextrema
+import openpyxl
+from openpyxl.styles import PatternFill, Font
+from openpyxl.utils import get_column_letter
+
+# Configuración de advertencias
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# Crear directorios si no existen
+os.makedirs("figuras", exist_ok=True)
+os.makedirs("Tablas", exist_ok=True)
+
+# =============================================================================
+# Nuevas funciones para manejar escala
+# =============================================================================
+def get_scale_preference():
+    print("\n=== SELECCIÓN DE ESCALA ===")
+    print("1. Escala lineal (recomendado para corto plazo)")
+    print("2. Escala semi-logarítmica (recomendado para largo plazo/activos volátiles)")
+    choice = input("Seleccione tipo de escala (1-2) [1]: ").strip() or "1"
+    return "log" if choice == "2" else "linear"
+
+def apply_scale_transformation(df, scale_type):
+    """Aplica transformación de escala a los datos"""
+    if scale_type == "log":
+        # Verificar que no haya precios <= 0
+        if (df[['open', 'high', 'low', 'close']] <= 0).any().any():
+            print("Advertencia: Precios no positivos detectados. Usando escala lineal.")
+            return df.copy()
+        
+        # Crear copia para no modificar el original
+        df_log = df.copy()
+        
+        # Aplicar logaritmo natural a las columnas de precio
+        for col in ['open', 'high', 'low', 'close']:
+            df_log[col] = np.log(df_log[col])
+            
+        return df_log
+    return df.copy()
+
+def reverse_log_values(log_value):
+    """Convierte valores logarítmicos de vuelta a precios reales"""
+    return np.exp(log_value)
+
+# =============================================================================
+# Funciones mejoradas de ZigZag
+# =============================================================================
+def puntos_zigzag_mayores(df, window):
+    df = df.copy()
+    df['max_local'] = df['high'].rolling(window=window, min_periods=1).max()
+    df['min_local'] = df['low'].rolling(window=window, min_periods=1).min()
+    
+    max_mask = (df['high'] == df['max_local'])
+    min_mask = (df['low'] == df['min_local'])
+    
+    puntos = []
+    for idx, row in df.iterrows():
+        if max_mask.loc[idx]:
+            puntos.append(('max', idx, row['high']))
+        if min_mask.loc[idx]:
+            puntos.append(('min', idx, row['low']))
+    
+    if not puntos:
+        return []
+    
+    filtrados = [puntos[0]]
+    for i in range(1, len(puntos)):
+        tipo_actual, idx_actual, val_actual = puntos[i]
+        tipo_prev, idx_prev, val_prev = filtrados[-1]
+        
+        if tipo_actual != tipo_prev:
+            filtrados.append(puntos[i])
+        else:
+            if (tipo_actual == 'max' and val_actual > val_prev) or \
+               (tipo_actual == 'min' and val_actual < val_prev):
+                filtrados[-1] = puntos[i]
+    
+    return filtrados
+
+def detectar_sr_zigzag(señales, tolerancia=0.01):
+    if not señales:
+        return []
+    
+    maximos = [valor for tipo, _, valor in señales if tipo == 'max']
+    minimos = [valor for tipo, _, valor in señales if tipo == 'min']
+    
+    niveles = []
+    for grupo in [maximos, minimos]:
+        if not grupo:
+            continue
+            
+        grupo.sort()
+        cluster = [grupo[0]]
+        for i in range(1, len(grupo)):
+            if abs(grupo[i] - cluster[-1]) / cluster[-1] <= tolerancia:
+                cluster.append(grupo[i])
+            else:
+                niveles.append(sum(cluster)/len(cluster))
+                cluster = [grupo[i]]
+        if cluster:
+            niveles.append(sum(cluster)/len(cluster))
+    
+    return sorted(niveles)
+
+def detectar_sr_congestion(df, num_niveles=5, sensibilidad=0.03):
+    precios = df['close'].dropna().values
+    if len(precios) < 10:
+        return []
+    
+    rango = precios.max() - precios.min()
+    bw = sensibilidad * rango if rango > 0 else 0.03
+    
+    kde = gaussian_kde(precios, bw_method=bw)
+    p_min, p_max = precios.min(), precios.max()
+    price_range = np.linspace(p_min, p_max, 500)
+    densidad = kde(price_range)
+    
+    picos = argrelextrema(densidad, np.greater, order=3)[0]
+    if len(picos) == 0:
+        return []
+    
+    prominencias = []
+    for pico in picos:
+        left = max(0, pico-10)
+        right = min(len(densidad)-1, pico+10)
+        valle = min(densidad[left], densidad[right])
+        prominencias.append(densidad[pico] - valle)
+    
+    if len(picos) > num_niveles:
+        idx_top = np.argsort(prominencias)[-num_niveles:]
+        niveles = price_range[picos[idx_top]]
+    else:
+        niveles = price_range[picos]
+    
+    return sorted(niveles)
+
+def calcular_atr_actual(df, periodo=14):
+    """Calcula ATR con manejo ultra seguro de cualquier caso"""
+    # Casos extremos primero
+    if not isinstance(df, pd.DataFrame) or df.empty or len(df) < 2:
+        return 0.01  # Valor predeterminado seguro
+    
+    # Verificar columnas necesarias
+    required_cols = ['high', 'low', 'close']
+    missing = [col for col in required_cols if col not in df.columns]
+    if missing:
+        return 0.01 * df.iloc[-1]['close'] if 'close' in df.columns else 0.01
+    
+    # Calcular True Range de forma segura
+    try:
+        # Usamos operaciones vectorizadas con manejo de NaN
+        high = df['high'].values
+        low = df['low'].values
+        close = df['close'].values
+        
+        # Calcular componentes de TR
+        tr1 = high - low
+        tr2 = np.abs(high - np.roll(close, 1))
+        tr3 = np.abs(low - np.roll(close, 1))
+        
+        # Ignorar el primer valor (no tiene close anterior)
+        tr = np.maximum.reduce([tr1, tr2, tr3])[1:]
+        
+        # Manejar caso con pocos datos
+        if len(tr) == 0:
+            return np.mean(tr1)  # Fallback a high-low
+        
+        # Calcular ATR con los últimos 'periodo' valores
+        return tr[-min(periodo, len(tr)):].mean()
+    
+    except Exception:
+        # Fallback simple si algo sale mal
+        return (df['high'] - df['low']).mean()
+
+def proyectar_siguiente_zigzag(señales, current_index, df, window_size, current_price, is_log_scale=False):
+    """
+    Sistema completo de proyecciones coherentes con doble nivel:
+    - Proyección primaria (zz1)
+    - Proyección secundaria (zz2) cuando la primaria no es coherente
+    - Verificación estricta de direccionalidad
+    """
+    def calcular_proyeccion(señales_subset):
+        """Función interna para calcular una proyección coherente"""
+        if len(señales_subset) < 2:
+            return None, None, None
+
+        # Calcular ATR adaptativo
+        periodo_atr = max(14, min(50, window_size // 2))
+        atr = calcular_atr_actual(df, periodo=periodo_atr)
+        
+        # Valor mínimo de ATR
+        if 'close' in df.columns and not df.empty:
+            last_close = df['close'].iloc[-1]
+            atr = max(atr, 0.001 * last_close)
+
+        movimientos = []
+        tiempos = []
+        
+        # Determinar último tipo
+        last_type = señales_subset[-1][0]
+
+        # Estrategia para ventanas grandes (ZZ1)
+        if window_size > 30:
+            # Considerar hasta 5 movimientos completos
+            n = min(5, len(señales_subset)-1)
+            for i in range(2, n+1):
+                if i >= len(señales_subset):
+                    break
+                    
+                # Tomar pares completos
+                start = señales_subset[-i-1]
+                end = señales_subset[-i]
+                
+                if start[0] != end[0]:  # Deben ser opuestos
+                    magnitud = end[2] - start[2]
+                    
+                    # Filtrar movimientos extremos (> 4xATR)
+                    if abs(magnitud) <= 4 * atr:
+                        movimientos.append(magnitud)
+                        
+                        # Calcular tiempo entre puntos
+                        if isinstance(end[1], pd.Timestamp) and isinstance(start[1], pd.Timestamp):
+                            delta = (end[1] - start[1]).total_seconds()
+                        else:
+                            delta = abs(end[1] - start[1])
+                        
+                        tiempos.append(delta)
+        else:  # ZigZag 2 (ventana pequeña)
+            # Considerar movimientos individuales
+            n = min(4, len(señales_subset)-1)
+            for i in range(1, n+1):
+                if i >= len(señales_subset):
+                    break
+                    
+                anterior = señales_subset[-i-1]
+                actual = señales_subset[-i]
+                
+                if anterior[0] != actual[0]:
+                    magnitud = actual[2] - anterior[2]
+                    
+                    # Filtrar movimientos extremos (> 3xATR)
+                    if abs(magnitud) <= 3 * atr:
+                        movimientos.append(magnitud)
+                        
+                        # Calcular tiempo entre puntos
+                        if isinstance(actual[1], pd.Timestamp) and isinstance(anterior[1], pd.Timestamp):
+                            delta = (actual[1] - anterior[1]).total_seconds()
+                        else:
+                            delta = abs(actual[1] - anterior[1])
+                        
+                        tiempos.append(delta)
+
+        # CORRECCIÓN CRÍTICA: Filtrar movimientos por dirección
+        if last_type == 'min':
+            # Para mínimos: usar solo movimientos alcistas (positivos)
+            movimientos = [m for m in movimientos if m > 0]
+        else:  # 'max'
+            # Para máximos: usar solo movimientos bajistas (negativos)
+            movimientos = [m for m in movimientos if m < 0]
+
+        # Manejar casos sin movimientos válidos
+        if not movimientos:
+            # Crear movimiento en la dirección correcta
+            if last_type == 'min':
+                movimientos.append(abs(atr) * 1.5)  # Movimiento alcista
+            else:
+                movimientos.append(-abs(atr) * 1.5)  # Movimiento bajista
+                
+            # Tiempo proporcional al tamaño de ventana
+            default_time = 86400 * (window_size/5)  # Base de 1 día ajustada
+            tiempos.append(tiempos[-1] if tiempos else default_time)
+
+        # Calcular proyección con mediana (robusta)
+        magnitud_proy = np.median(movimientos)
+        
+        # Factor de reducción para ZZ2 (ventana pequeña)
+        if window_size < 10:
+            magnitud_proy *= 0.7
+
+        # Ajuste específico para ZZ1 (ventana grande)
+        if window_size > 30:
+            # Suavizar movimientos grandes
+            magnitud_proy *= 0.85
+            
+            # Limitar por volatilidad histórica
+            hist_vol = df['close'].pct_change().std() * 100
+            max_move = hist_vol * 0.5 * window_size
+            if abs(magnitud_proy) > abs(max_move):
+                magnitud_proy = max_move * (1 if magnitud_proy > 0 else -1)
+
+        # Limitar por volatilidad máxima (2xATR para ZZ2, 3xATR para ZZ1)
+        vol_limit = 3.0 * atr if window_size > 30 else 2.0 * atr
+        if abs(magnitud_proy) > vol_limit:
+            signo = 1 if magnitud_proy > 0 else -1
+            magnitud_proy = signo * vol_limit * 0.9
+
+        # Determinar tipo de proyección
+        siguiente_tipo = 'min' if last_type == 'max' else 'max'
+        
+        # Calcular valor - CORRECCIÓN DIRECCIONAL
+        ultimo_valor = señales_subset[-1][2]
+        if last_type == 'min':
+            # Proyección hacia arriba (alcista)
+            if is_log_scale:
+                valor_proy = ultimo_valor * np.exp(abs(magnitud_proy))
+            else:
+                valor_proy = ultimo_valor + abs(magnitud_proy)
+        else:
+            # Proyección hacia abajo (bajista)
+            if is_log_scale:
+                valor_proy = ultimo_valor * np.exp(-abs(magnitud_proy))
+            else:
+                valor_proy = ultimo_valor - abs(magnitud_proy)
+
+        # Calcular tiempo
+        tiempo_proy = np.median(tiempos) if tiempos else 86400 * (window_size/10)
+        ultimo_tiempo = señales_subset[-1][1]
+        if isinstance(ultimo_tiempo, pd.Timestamp):
+            tiempo_proyectado = ultimo_tiempo + pd.Timedelta(seconds=tiempo_proy)
+        else:
+            tiempo_proyectado = ultimo_tiempo + tiempo_proy
+
+        return siguiente_tipo, tiempo_proyectado, valor_proy
+
+    # --- Proyección primaria ---
+    if not señales:
+        return {'primary': None, 'secondary': None}
+    
+    primary_type, primary_time, primary_value = calcular_proyeccion(señales)
+    
+    # --- Proyección secundaria (si es necesario) ---
+    secondary_type, secondary_time, secondary_value = None, None, None
+    
+    # Comprobar coherencia de la proyección primaria
+    if primary_value is not None:
+        last_point_type = señales[-1][0]
+        
+        # Caso 1: Último punto es mínimo -> Proyección debe ser máximo > precio actual
+        if last_point_type == 'min':
+            if primary_value <= current_price:
+                # Crear señal alternativa (retroceder un punto)
+                if len(señales) >= 3:
+                    alt_señales = señales[:-1]
+                    secondary_type, secondary_time, secondary_value = calcular_proyeccion(alt_señales)
+                    
+                    # Forzar coherencia en la proyección secundaria
+                    if secondary_value is not None and secondary_value <= current_price:
+                        secondary_value = None
+        
+        # Caso 2: Último punto es máximo -> Proyección debe ser mínimo < precio actual
+        elif last_point_type == 'max':
+            if primary_value >= current_price:
+                if len(señales) >= 3:
+                    alt_señales = señales[:-1]
+                    secondary_type, secondary_time, secondary_value = calcular_proyeccion(alt_señales)
+                    
+                    if secondary_value is not None and secondary_value >= current_price:
+                        secondary_value = None
+
+    return {
+        'primary': (primary_type, primary_time, primary_value),
+        'secondary': (secondary_type, secondary_time, secondary_value)
+    }
+
+def nivel_cercano(valor, niveles, umbral=0.02):
+    if not niveles or valor is None:
+        return None, None
+    
+    distancias = [abs(niv - valor) for niv in niveles]
+    idx_min = np.argmin(distancias)
+    min_dist = distancias[idx_min]
+    
+    dist_rel = min_dist / valor
+    return niveles[idx_min], dist_rel if dist_rel <= umbral else None
+
+def menu_parametros_zigzag():
+    print("\n=== CONFIGURACIÓN DE ANÁLISIS ZIGZAG ===")
+    try:
+        window1 = int(input("Tamaño ventana para ZigZag 1 [50]: ") or 50)
+        window2 = int(input("Tamaño ventana para ZigZag 2 [10]: ") or 10)
+        tolerancia = float(input("Tolerancia S/R (0.01-0.05) [0.01]: ") or 0.01)
+        sensibilidad = float(input("Sensibilidad congestión (0.01-0.05) [0.02]: ") or 0.02)
+    except Exception as e:
+        print(f"Error en entrada: {e}. Usando valores por defecto")
+        window1, window2, tolerancia, sensibilidad = 50, 10, 0.01, 0.02
+    
+    return {
+        'windows': [max(1, window1), max(1, window2)],
+        'tolerancia': max(0.001, min(0.1, tolerancia)),
+        'sensibilidad': max(0.005, min(0.1, sensibilidad))
+    }
+
+# =============================================================================
+# Funciones mejoradas de Ondas de Elliott (actualizadas para manejar escala log)
+# =============================================================================
+class ZZ:
+    def __init__(self, maxlen=15):
+        self.d = [0] * maxlen
+        self.x = [0] * maxlen
+        self.y = [0.0] * maxlen
+        self.min_swing = 0
+
+    def in_out(self, d, x1, y1, x2, y2):
+        self.d = [d] + self.d[:-1]
+        self.x = [x2] + self.x[:-1]
+        self.y = [y2] + self.y[:-1]
+
+def calculate_atr(df, period=14):
+    df = df.copy()
+    high_low = df['high'] - df['low']
+    high_close_prev = abs(df['high'] - df['close'].shift(1))
+    low_close_prev = abs(df['low'] - df['close'].shift(1))
+    
+    df['tr'] = pd.concat([high_low, high_close_prev, low_close_prev], axis=1).max(axis=1)
+    df['atr'] = df['tr'].rolling(period).mean()
+    return df
+
+def get_hi(row, i_hi):
+    if i_hi == 'high': return row['high']
+    if i_hi == 'close': return row['close']
+    return max(row['open'], row['close'])
+
+def get_lo(row, i_lo):
+    if i_lo == 'low': return row['low']
+    if i_lo == 'close': return row['close']
+    return min(row['open'], row['close'])
+
+def pivot_high(series, left, right, min_value=0):
+    result = np.full(len(series), np.nan)
+    for i in range(left, len(series) - right):
+        window = series[i - left:i + right + 1]
+        if series[i] == np.nanmax(window) and series[i] - np.nanmin(window) >= min_value:
+            result[i] = series[i]
+    return result
+
+def pivot_low(series, left, right, min_value=0):
+    result = np.full(len(series), np.nan)
+    for i in range(left, len(series) - right):
+        window = series[i - left:i + right + 1]
+        if series[i] == np.nanmin(window) and np.nanmax(window) - series[i] >= min_value:
+            result[i] = series[i]
+    return result
+
+def validate_impulse_wave(points, current_price, atr_value, is_log_scale=False):
+    if len(points) < 6:
+        return False, "", 0, []
+    
+    y = [p[1] for p in points]
+    P0, P1, P2, P3, P4, P5 = y
+
+    # Determinar dirección
+    is_bullish = (P0 < P1 > P2 < P3 > P4 < P5) and (P5 > P3)
+    is_bearish = (P0 > P1 < P2 > P3 < P4 > P5) and (P5 < P3)
+
+    if not (is_bullish or is_bearish):
+        return False, "", 0, []
+    
+    # Cálculo de longitudes de onda
+    if is_bullish:
+        if is_log_scale:
+            # En escala log, las diferencias son proporciones
+            W1 = P1 - P0  # log(P1/P0)
+            W2 = P1 - P2
+            W3 = P3 - P2
+            W4 = P3 - P4
+            W5 = P5 - P4
+        else:
+            W1 = P1 - P0
+            W2 = P1 - P2
+            W3 = P3 - P2
+            W4 = P3 - P4
+            W5 = P5 - P4
+    else:
+        if is_log_scale:
+            W1 = P0 - P1
+            W2 = P2 - P1
+            W3 = P2 - P3
+            W4 = P4 - P3
+            W5 = P4 - P5
+        else:
+            W1 = P0 - P1
+            W2 = P2 - P1
+            W3 = P2 - P3
+            W4 = P4 - P3
+            W5 = P4 - P5
+
+    # Validaciones clave de proporciones entre subondas
+    if W3 <= min(W1, W5) or W1 <= 0 or W3 <= 0:
+        return False, "", 0, []
+    if W2 / W1 > 1.0:  # Onda 2 no debe retroceder más del 100% de Onda 1
+        return False, "", 0, []
+    if (is_bullish and P4 < P1) or (is_bearish and P4 > P1):  # Onda 4 no debe solaparse con Onda 1
+        return False, "", 0, []
+    if W4 / W3 > 0.5:  # Onda 4 no debe retroceder más del 50% de Onda 3
+        return False, "", 0, []
+
+    current_wave = ""
+    progress = 0.0
+    price_targets = []
+
+    if is_bullish:
+        if current_price < P4:
+            current_wave = "4"
+            progress = (current_price - P3) / (P4 - P3) * 100 if P3 != P4 else 0
+        elif current_price < P5:
+            current_wave = "5"
+            progress = (current_price - P4) / (P5 - P4) * 100 if P4 != P5 else 0
+
+            # PROYECCIÓN CORREGIDA: usar W1 desde P4
+            if is_log_scale:
+                # Convertir W1 a proporción: exp(W1) = P1/P0
+                base_ratio = np.exp(W1)
+                # Objetivos: P4 * (base_ratio)^fib_ratio
+                targets = [
+                    P4 + np.log(base_ratio * 0.618),
+                    P4 + np.log(base_ratio * 1.0),
+                    P4 + np.log(base_ratio * 1.618)
+                ]
+            else:
+                base = W1
+                targets = [
+                    P4 + base * 0.618,
+                    P4 + base * 1.0,
+                    P4 + base * 1.618
+                ]
+            price_targets = sorted([t for t in targets if t > current_price])
+        else:
+            current_wave = "Completada"
+            progress = 100.0
+    else:
+        if current_price > P4:
+            current_wave = "4"
+            progress = (P3 - current_price) / (P3 - P4) * 100 if P3 != P4 else 0
+        elif current_price > P5:
+            current_wave = "5"
+            progress = (P4 - current_price) / (P4 - P5) * 100 if P4 != P5 else 0
+
+            # PROYECCIÓN CORREGIDA: usar W1 desde P4
+            if is_log_scale:
+                base_ratio = np.exp(W1)
+                targets = [
+                    P4 - np.log(base_ratio * 0.618),
+                    P4 - np.log(base_ratio * 1.0),
+                    P4 - np.log(base_ratio * 1.618)
+                ]
+            else:
+                base = W1
+                targets = [
+                    P4 - base * 0.618,
+                    P4 - base * 1.0,
+                    P4 - base * 1.618
+                ]
+            price_targets = sorted([t for t in targets if t < current_price], reverse=True)
+        else:
+            current_wave = "Completada"
+            progress = 100.0
+    
+    return True, current_wave, progress, price_targets
+
+def validate_correction_wave(points, current_price, atr_value, is_log_scale=False):
+    if len(points) < 3: 
+        return False, "", 0, []
+    
+    y = [p[1] for p in points]
+    A, B, C = y
+    
+    # Validación mejorada con proporciones Fibonacci
+    is_bullish_corr = (A > B and C > B and C < A)
+    is_bearish_corr = (A < B and C < B and C > A)
+    
+    if not (is_bullish_corr or is_bearish_corr):
+        return False, "", 0, []
+    
+    # Validación de retrocesos Fibonacci
+    if (is_bullish_corr and B < A * 0.618) or (is_bearish_corr and B > A * (1 - 0.618)):
+        return False, "", 0, []  # Retroceso mínimo no válido
+    
+    current_wave = ""
+    progress = 0.0
+    price_targets = []
+    height = abs(A - B)  # Longitud de la onda A
+    
+    if is_bullish_corr:
+        if current_price < B:
+            current_wave = "B"
+            progress = (B - current_price) / (B - A) * 100 if B != A else 0
+        elif current_price < C:
+            current_wave = "C"
+            progress = (current_price - B) / (C - B) * 100 if C != B else 0
+            
+            # Proyección corregida con retrocesos Fibonacci
+            if is_log_scale:
+                height_ratio = np.exp(height)
+                targets = [
+                    B + np.log(height_ratio * 0.618),
+                    B + np.log(height_ratio * 1.0),
+                    B + np.log(height_ratio * 1.618)
+                ]
+            else:
+                targets = [
+                    B + height * 0.618,
+                    B + height * 1.0,
+                    B + height * 1.618
+                ]
+            price_targets = sorted([t for t in targets if t > current_price])
+        else:
+            current_wave = "Completada"
+            progress = 100.0
+    else:
+        if current_price > B:
+            current_wave = "B"
+            progress = (current_price - A) / (B - A) * 100 if A != B else 0
+        elif current_price > C:
+            current_wave = "C"
+            progress = (B - current_price) / (B - C) * 100 if B != C else 0
+            
+            # Proyección corregida con retrocesos Fibonacci
+            if is_log_scale:
+                height_ratio = np.exp(height)
+                targets = [
+                    B - np.log(height_ratio * 0.618),
+                    B - np.log(height_ratio * 1.0),
+                    B - np.log(height_ratio * 1.618)
+                ]
+            else:
+                targets = [
+                    B - height * 0.618,
+                    B - height * 1.0,
+                    B - height * 1.618
+                ]
+            price_targets = sorted([t for t in targets if t < current_price], reverse=True)
+        else:
+            current_wave = "Completada"
+            progress = 100.0
+    
+    return True, current_wave, progress, price_targets
+
+def validate_triangle_wave(points, current_price, atr_value, is_log_scale=False):
+    if len(points) < 5: 
+        return False, "", 0, []
+    
+    y = [p[1] for p in points]
+    A, B, C, D, E = y
+    
+    # Validación mejorada con 5 subondas
+    is_contracting = (max(A, C, E) > max(B, D) and min(A, C, E) > min(B, D))
+    is_expanding = (max(A, C, E) < max(B, D) and min(A, C, E) < min(B, D))
+    
+    if not (is_contracting or is_expanding):
+        return False, "", 0, []
+    
+    # Validación de que todas las subondas están dentro del rango
+    if not (min(A, E) <= B <= max(A, E) and min(A, E) <= C <= max(A, E) and min(A, E) <= D <= max(A, E)):
+        return False, "", 0, []
+    
+    current_wave = "E"
+    progress = 100.0
+    price_targets = []
+    height = max(A, C, E) - min(B, D)
+    
+    if is_contracting:
+        if E > D:  # Ruptura alcista
+            if is_log_scale:
+                height_ratio = np.exp(height)
+                targets = [
+                    E + np.log(height_ratio * 0.618),
+                    E + np.log(height_ratio * 1.0),
+                    E + np.log(height_ratio * 1.618)
+                ]
+            else:
+                targets = [
+                    E + height * 0.618,
+                    E + height * 1.0,
+                    E + height * 1.618
+                ]
+            price_targets = sorted([t for t in targets if t > current_price])
+        else:  # Ruptura bajista
+            if is_log_scale:
+                height_ratio = np.exp(height)
+                targets = [
+                    E - np.log(height_ratio * 0.618),
+                    E - np.log(height_ratio * 1.0),
+                    E - np.log(height_ratio * 1.618)
+                ]
+            else:
+                targets = [
+                    E - height * 0.618,
+                    E - height * 1.0,
+                    E - height * 1.618
+                ]
+            price_targets = sorted([t for t in targets if t < current_price], reverse=True)
+    elif is_expanding:
+        if E > D:  # Ruptura alcista
+            if is_log_scale:
+                height_ratio = np.exp(height)
+                targets = [
+                    E + np.log(height_ratio * 0.382),
+                    E + np.log(height_ratio * 0.618),
+                    E + np.log(height_ratio * 1.0)
+                ]
+            else:
+                targets = [
+                    E + height * 0.382,
+                    E + height * 0.618,
+                    E + height * 1.0
+                ]
+            price_targets = sorted([t for t in targets if t > current_price])
+        else:  # Ruptura bajista
+            if is_log_scale:
+                height_ratio = np.exp(height)
+                targets = [
+                    E - np.log(height_ratio * 0.382),
+                    E - np.log(height_ratio * 0.618),
+                    E - np.log(height_ratio * 1.0)
+                ]
+            else:
+                targets = [
+                    E - height * 0.382,
+                    E - height * 0.618,
+                    E - height * 1.0
+                ]
+            price_targets = sorted([t for t in targets if t < current_price], reverse=True)
+    
+    return True, current_wave, progress, price_targets
+
+def detect_elliott_waves(df, wave_level, incluir_menores=True, i_hi='high', i_lo='low', maxlen=15, is_log_scale=False):
+    if df.empty or len(df) < 100: 
+        return []
+    
+    # Calcular ATR
+    df = calculate_atr(df)
+    avg_atr = df['atr'].mean(skipna=True)
+    
+    # Factores de min_swing por nivel (ajustados para detección de subondas)
+    min_swing_factors = {
+        "Primary": 1.8,
+        "Intermediate": 1.2,
+        "Minor": 0.8,
+        "Minute": 0.5
+    }
+    
+    # Obtener precio actual
+    current_price = df['close'].iloc[-1]
+    
+    # Series de precios optimizadas
+    hi = df[i_hi].values if i_hi in df.columns else df.apply(lambda row: get_hi(row, i_hi), axis=1).values
+    lo = df[i_lo].values if i_lo in df.columns else df.apply(lambda row: get_lo(row, i_lo), axis=1).values
+    
+    patterns = []
+    
+    # Determinar niveles a analizar (incluyendo subniveles)
+    if incluir_menores:
+        if wave_level == "Primary":
+            wave_levels = ["Primary", "Intermediate", "Minor", "Minute"]
+        elif wave_level == "Intermediate":
+            wave_levels = ["Intermediate", "Minor", "Minute"]
+        elif wave_level == "Minor":
+            wave_levels = ["Minor", "Minute"]
+        elif wave_level == "Minute":
+            wave_levels = ["Minute"]
+        else:
+            wave_levels = ["Intermediate"]
+    else:
+        wave_levels = [wave_level]
+    
+    # Configuración para cada nivel de onda
+    for level in wave_levels:
+        # Configuración adaptativa para diferentes grados de ondas
+        if level == "Primary":
+            left_bars = 25
+        elif level == "Intermediate":
+            left_bars = 10
+        elif level == "Minor":
+            left_bars = 5
+        elif level == "Minute":
+            left_bars = 3
+        else:
+            left_bars = 10
+            
+        # Ajustar min_swing según nivel
+        min_swing_factor = min_swing_factors.get(level, 1.0)
+        min_swing = avg_atr * min_swing_factor
+        
+        zz = ZZ(maxlen)
+        zz.min_swing = min_swing
+        
+        # Detectar pivotes con parámetros adaptativos
+        ph = pivot_high(hi, left_bars, 1, min_swing * 0.7)
+        pl = pivot_low(lo, left_bars, 1, min_swing * 0.7)
+        
+        for idx in range(len(df)):
+            current_atr = df.at[idx, 'atr'] if not np.isnan(df.at[idx, 'atr']) else avg_atr
+            
+            # Procesar pivotes altos (subondas alcistas)
+            if not np.isnan(ph[idx]):
+                current_dir = zz.d[0]
+                last_x, last_y = zz.x[0], zz.y[0]
+                
+                if current_dir < 1:
+                    zz.in_out(1, last_x, last_y, idx, hi[idx])
+                elif hi[idx] > last_y:
+                    zz.x[0], zz.y[0] = idx, hi[idx]
+                
+                # Detectar ondas con los puntos disponibles
+                valid_points = [p for p in zz.y if p != 0]
+                
+                # Detectar impulso (6 subondas)
+                if len(valid_points) >= 6:
+                    points = list(zip(zz.x[:6][::-1], zz.y[:6][::-1]))
+                    valid, current_wave, progress, targets = validate_impulse_wave(
+                        points, current_price, current_atr, is_log_scale
+                    )
+                    if valid:
+                        last_idx = int(points[-1][0])
+                        volume_confirmation = "No"
+                        if 'volume' in df.columns and last_idx < len(df):
+                            avg_volume = df['volume'].iloc[max(0, last_idx-20):last_idx].mean()
+                            if avg_volume > 0 and df['volume'].iloc[last_idx] > 1.5 * avg_volume:
+                                volume_confirmation = "Sí"
+                        
+                        patterns.append({
+                            'idx': idx, 
+                            'type': 'bullish impulse' if points[0][1] < points[1][1] else 'bearish impulse', 
+                            'points': points, 
+                            'color': 'blue' if level == "Primary" else 'green',
+                            'current_wave': current_wave,
+                            'progress': progress,
+                            'price_targets': targets,
+                            'wave_level': level,
+                            'volume_confirmation': volume_confirmation
+                        })
+                
+                # Detectar triángulos (5 subondas)
+                if len(valid_points) >= 5:
+                    points = list(zip(zz.x[:5][::-1], zz.y[:5][::-1]))
+                    valid, current_wave, progress, targets = validate_triangle_wave(
+                        points, current_price, current_atr, is_log_scale
+                    )
+                    if valid:
+                        last_idx = int(points[-1][0])
+                        volume_confirmation = "No"
+                        if 'volume' in df.columns and last_idx < len(df):
+                            avg_volume = df['volume'].iloc[max(0, last_idx-20):last_idx].mean()
+                            if avg_volume > 0 and df['volume'].iloc[last_idx] < 0.8 * avg_volume: # Bajo volumen para triángulos
+                                volume_confirmation = "Sí"
+                        
+                        patterns.append({
+                            'idx': idx, 
+                            'type': 'triangle', 
+                            'points': points, 
+                            'color': 'orange',
+                            'current_wave': current_wave,
+                            'progress': progress,
+                            'price_targets': targets,
+                            'wave_level': level,
+                            'volume_confirmation': volume_confirmation
+                        })
+            
+            # Procesar pivotes bajos (subondas bajistas)
+            if not np.isnan(pl[idx]):
+                current_dir = zz.d[0]
+                last_x, last_y = zz.x[0], zz.y[0]
+                
+                if current_dir > -1:
+                    zz.in_out(-1, last_x, last_y, idx, lo[idx])
+                elif lo[idx] < last_y:
+                    zz.x[0], zz.y[0] = idx, lo[idx]
+                
+                valid_points = [p for p in zz.y if p != 0]
+                
+                # Detectar impulso (6 subondas)
+                if len(valid_points) >= 6:
+                    points = list(zip(zz.x[:6][::-1], zz.y[:6][::-1]))
+                    valid, current_wave, progress, targets = validate_impulse_wave(
+                        points, current_price, current_atr, is_log_scale
+                    )
+                    if valid:
+                        last_idx = int(points[-1][0])
+                        volume_confirmation = "No"
+                        if 'volume' in df.columns and last_idx < len(df):
+                            avg_volume = df['volume'].iloc[max(0, last_idx-20):last_idx].mean()
+                            if avg_volume > 0 and df['volume'].iloc[last_idx] > 1.5 * avg_volume:
+                                volume_confirmation = "Sí"
+                        
+                        patterns.append({
+                            'idx': idx, 
+                            'type': 'bullish impulse' if points[0][1] < points[1][1] else 'bearish impulse', 
+                            'points': points, 
+                            'color': 'blue' if level == "Primary" else 'green',
+                            'current_wave': current_wave,
+                            'progress': progress,
+                            'price_targets': targets,
+                            'wave_level': level,
+                            'volume_confirmation': volume_confirmation
+                        })
+                
+                # Detectar correcciones (3 subondas)
+                if len(valid_points) >= 3:
+                    points = list(zip(zz.x[:3][::-1], zz.y[:3][::-1]))
+                    valid, current_wave, progress, targets = validate_correction_wave(
+                        points, current_price, current_atr, is_log_scale
+                    )
+                    if valid:
+                        wave_type = 'bullish correction' if points[0][1] > points[1][1] else 'bearish correction'
+                        
+                        last_idx = int(points[-1][0])
+                        volume_confirmation = "No"
+                        if 'volume' in df.columns and last_idx < len(df):
+                            avg_volume = df['volume'].iloc[max(0, last_idx-20):last_idx].mean()
+                            if avg_volume > 0 and df['volume'].iloc[last_idx] > 1.2 * avg_volume:
+                                volume_confirmation = "Sí"
+                        
+                        patterns.append({
+                            'idx': idx, 
+                            'type': wave_type, 
+                            'points': points, 
+                            'color': 'purple',
+                            'current_wave': current_wave,
+                            'progress': progress,
+                            'price_targets': targets,
+                            'wave_level': level,
+                            'volume_confirmation': volume_confirmation
+                        })
+    
+    return patterns
+
+def plot_recent_waves(df, patterns, zigzag_points1, zigzag_points2, file_name, wave_level, 
+                      start_date=None, end_date=None, max_patterns=5, is_log_scale=False):
+    plt.figure(figsize=(20, 12))
+    
+    # Filtrar por rango de fechas
+    if start_date is None:
+        start_date = df['datetime'].min()
+    if end_date is None:
+        end_date = df['datetime'].max()
+    
+    df_recent = df[(df['datetime'] >= start_date) & (df['datetime'] <= end_date)]
+    
+    if df_recent.empty:
+        print("No hay datos en el rango de fechas seleccionado")
+        return
+    
+    # Precio actual (convertir si es escala log)
+    current_price = df['close'].iloc[-1]
+    actual_current_price = reverse_log_values(current_price) if is_log_scale else current_price
+    
+    # Gráfico de precios
+    plt.plot(df_recent['datetime'], df_recent['close'], label='Precio', color='black', alpha=0.9, linewidth=2.0)
+    
+    # Precio actual
+    plt.axhline(y=current_price, color='gray', linestyle='--', alpha=0.7)
+    plt.annotate(f'Precio Actual: {actual_current_price:.6f}', 
+                 xy=(df_recent['datetime'].iloc[-1], current_price),
+                 xytext=(10, 10), textcoords='offset points',
+                 fontsize=10, bbox=dict(fc='white', alpha=0.8))
+    
+    # Filtrar patrones visibles
+    recent_patterns = []
+    for pat in patterns:
+        # Verificar que los puntos sean accesibles
+        pattern_dates = []
+        for pt in pat['points']:
+            if isinstance(pt[0], int) and pt[0] < len(df):
+                date_val = df.at[pt[0], 'datetime']
+                pattern_dates.append(date_val)
+        
+        if any((date >= start_date) and (date <= end_date) for date in pattern_dates):
+            recent_patterns.append(pat)
+    
+    # Limitar a los últimos patrones
+    if len(recent_patterns) > max_patterns:
+        recent_patterns = recent_patterns[-max_patterns:]
+    
+    # Dibujar patrones y subondas
+    for pat in recent_patterns:
+        x = []
+        y = []
+        for pt in pat['points']:
+            if isinstance(pt[0], int) and pt[0] < len(df):
+                x.append(df.at[pt[0], 'datetime'])
+                y.append(pt[1])
+        
+        if not x:  # Si no hay puntos válidos, saltar
+            continue
+            
+        # Configuración por tipo de subonda
+        if 'correction' in pat['type']:
+            style = {'ls': '--', 'marker': 'x', 'lw': 1.8, 'color': 'purple', 'labels': ['A', 'B', 'C']}
+        elif 'triangle' in pat['type']:
+            style = {'ls': '-.', 'marker': 's', 'lw': 2.2, 'color': 'orange', 'labels': ['A', 'B', 'C', 'D', 'E']}
+        else:
+            style = {'ls': '-', 'marker': 'o', 'lw': 2.5, 'color': pat['color'], 'labels': ['(1)', '(2)', '(3)', '(4)', '(5)']}
+        
+        # Dibujar patrón
+        plt.plot(x, y, marker=style['marker'], linestyle=style['ls'],
+                 color=style['color'], linewidth=style['lw'], alpha=0.9,
+                 label=f"{pat['type']} (Onda {pat['current_wave']}: {pat['progress']:.1f}% - {pat['wave_level']}")
+        
+        # Dibujar confirmación de volumen
+        if pat['volume_confirmation'] == "Sí" and x and y:
+            plt.plot(x[-1], y[-1], marker='*', markersize=10, color='red', alpha=0.7)
+        
+        # Dibujar objetivos para subondas activas
+        if pat['current_wave'] in ("5", "C") and pat['progress'] < 100 and pat['price_targets']:
+            for i, target in enumerate(pat['price_targets']):
+                color_target = 'green' if i == 0 else 'orange' if i == 1 else 'red'
+                plt.axhline(y=target, color=color_target, linestyle=':', alpha=0.7)
+                
+                # Convertir a precio real si es escala log
+                actual_target = reverse_log_values(target) if is_log_scale else target
+                
+                plt.annotate(f'Obj {i+1}: {actual_target:.6f}', 
+                             xy=(df_recent['datetime'].iloc[-1], target),
+                             xytext=(10, 5 if i % 2 == 0 else -20), 
+                             textcoords='offset points',
+                             fontsize=9, color=color_target,
+                             bbox=dict(fc='white', alpha=0.7))
+        
+        # Etiquetar subondas
+        labels = style['labels'][:len(y)]
+        for i, (xi, yi) in enumerate(zip(x, y)):
+            if (start_date <= xi <= end_date) and i < len(labels):
+                # Convertir a precio real si es escala log
+                actual_yi = reverse_log_values(yi) if is_log_scale else yi
+                
+                plt.annotate(labels[i], (xi, yi), xytext=(0, 10),
+                             textcoords="offset points", ha='center',
+                             fontsize=10, fontweight='bold', color=style['color'],
+                             bbox=dict(boxstyle='round,pad=0.2', fc='white', alpha=0.7))
+    
+    # Dibujar puntos ZigZag 1 (ventana grande)
+    for tipo, idx, valor in zigzag_points1:
+        if start_date <= idx <= end_date:
+            color = 'red' if tipo == 'max' else 'green'
+            
+            # Tamaños grandes para ZigZag 1
+            size = 120 if tipo == 'max' else 80
+            
+            plt.scatter(idx, valor, s=size, color=color, edgecolors='black', 
+                        zorder=5, alpha=0.9, marker='o', label='ZigZag 1')
+    
+    # Dibujar puntos ZigZag 2 (ventana pequeña)
+    for tipo, idx, valor in zigzag_points2:
+        if start_date <= idx <= end_date:
+            color = 'red' if tipo == 'max' else 'green'
+            
+            # Tamaños más pequeños para ZigZag 2
+            size = 80 if tipo == 'max' else 50
+            
+            plt.scatter(idx, valor, s=size, color=color, edgecolors='black', 
+                        zorder=4, alpha=0.9, marker='s', label='ZigZag 2')
+    
+    # Configurar escala del gráfico
+    if is_log_scale:
+        plt.yscale('log')
+        
+        # Formatear eje Y para mostrar precios reales
+        def log_to_actual(y, pos):
+            return f"{np.exp(y):.2f}"
+        
+        plt.gca().yaxis.set_major_formatter(ticker.FuncFormatter(log_to_actual))
+    
+    # Configuración final
+    plt.title(f'Análisis de Subondas - {start_date.date()} a {end_date.date()} - {file_name} ({wave_level})', fontsize=18)
+    plt.xlabel('Fecha', fontsize=14)
+    plt.ylabel('Precio', fontsize=14)
+    
+    # Manejar etiquetas duplicadas en la leyenda
+    handles, labels = plt.gca().get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    plt.legend(by_label.values(), by_label.keys(), loc='best', fontsize=10)
+    
+    plt.grid(True, alpha=0.3)
+    plt.gcf().autofmt_xdate()
+    plt.tight_layout()
+    
+    # Guardar con indicador de escala
+    scale_suffix = "_log" if is_log_scale else ""
+    plt.savefig(f'figuras/{file_name}_{wave_level}{scale_suffix}_subondas.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+def standardize_dataframe(df):
+    # Estandarizar nombres de columnas
+    df.columns = [c.lower().strip() for c in df.columns]
+    
+    # Mapeo de nombres
+    col_map = {
+        'open': 'open', 'high': 'high', 'low': 'low', 'close': 'close', 'volume': 'volume',
+        'price': 'close', 'apertura': 'open', 'máximo': 'high', 'maximo': 'high',
+        'mínimo': 'low', 'minimo': 'low', 'cierre': 'close', 'date': 'date',
+        'time': 'time', 'timestamp': 'datetime', 'fecha': 'date', 'hora': 'time',
+        'volumen': 'volume', 'vol': 'volume'
+    }
+    
+    # Renombrar columnas
+    df = df.rename(columns={c: col_map.get(c, c) for c in df.columns})
+    
+    # Crear datetime
+    if 'datetime' not in df.columns:
+        if 'date' in df.columns and 'time' in df.columns:
+            try:
+                df['datetime'] = pd.to_datetime(df['date'] + ' ' + df['time'])
+            except:
+                df['datetime'] = pd.to_datetime(df['date'])
+        elif 'date' in df.columns:
+            df['datetime'] = pd.to_datetime(df['date'])
+        else:
+            raise ValueError("Columnas de fecha no encontradas")
+    
+    # Verificar columnas esenciales
+    req_cols = ['open', 'high', 'low', 'close', 'volume', 'datetime']
+    missing = [c for c in req_cols if c not in df.columns]
+    if missing:
+        if 'volume' in missing:
+            df['volume'] = 1.0
+            print("Advertencia: Columna 'volume' no encontrada. Usando valores dummy.")
+            missing.remove('volume')
+        if missing:
+            raise ValueError(f"Columnas faltantes: {missing}")
+    
+    return df.sort_values('datetime').reset_index(drop=True)
+
+def parse_date(date_str):
+    try:
+        return datetime.strptime(date_str, '%Y-%m-%d')
+    except ValueError:
+        print("Formato de fecha inválido. Usando fecha por defecto.")
+        return None
+
+def get_wave_level():
+    print("\nSeleccione el nivel de onda principal:")
+    print("1. Primary (Ondas principales)")
+    print("2. Intermediate (Ondas intermedias)")
+    print("3. Minor (Subondas menores)")
+    print("4. Minute (Microondas)")
+    choice = input("Ingrese su elección (1-4): ").strip()
+    
+    levels = {
+        '1': "Primary",
+        '2': "Intermediate",
+        '3': "Minor",
+        '4': "Minute"
+    }
+    level = levels.get(choice, "Intermediate")
+    
+    incluir_menores = input(f"\n¿Incluir subniveles inferiores a {level}? (s/n): ").strip().lower()
+    incluir_menores = incluir_menores == 's'
+    
+    return level, incluir_menores
+
+def get_date_range():
+    print("\nIngrese rango de fechas (formato YYYY-MM-DD):")
+    start_date = input("Fecha de inicio (vacío = todo el historial): ").strip()
+    end_date = input("Fecha de fin (vacío = fecha actual): ").strip()
+    
+    start = parse_date(start_date) if start_date else None
+    end = parse_date(end_date) if end_date else None
+    
+    return start, end
+
+def get_confidence_level():
+    print("\nConfianza mínima para patrones:")
+    try:
+        confianza = float(input("Porcentaje (0-100) [50]: ").strip() or 50)
+        return max(0, min(100, confianza)) / 100.0
+    except:
+        print("Usando 50% por defecto.")
+        return 0.5
+
+# =============================================================================
+# SISTEMA DE CONFIANZA MEJORADO Y COHERENTE
+# =============================================================================
+def calculate_confidence(pat):
+    """
+    Calcula la confianza de un patrón de onda de Elliott considerando múltiples factores:
+    1. Tipo de patrón (base)
+    2. Confirmación de volumen
+    3. Progreso de la onda
+    4. Consistencia estructural
+    5. Nivel de onda
+    
+    Retorna un valor entre 0.1 (10%) y 1.0 (100%)
+    """
+    # Base de confianza basada en el tipo de patrón
+    base_conf = {
+        'impulse': 0.65,    # Mayor confianza en impulsos
+        'correction': 0.55, # Confianza media en correcciones
+        'triangle': 0.5     # Menor confianza en triángulos
+    }
+    
+    # Identificar tipo de patrón
+    if 'impulse' in pat['type']:
+        conf = base_conf['impulse']
+        tipo = 'impulse'
+    elif 'correction' in pat['type']:
+        conf = base_conf['correction']
+        tipo = 'correction'
+    else:  # triangle
+        conf = base_conf['triangle']
+        tipo = 'triangle'
+    
+    # 1. Confirmación de volumen (+15% si está presente)
+    if pat['volume_confirmation'] == "Sí":
+        conf *= 1.15
+    
+    # 2. Progreso de la onda (óptimo entre 30-70%)
+    progress = pat['progress']
+    if 30 <= progress <= 70:  # Zona óptima de desarrollo
+        conf *= 1.2
+    elif progress < 20 or progress > 80:  # Etapas iniciales o finales
+        conf *= 0.9
+    
+    # 3. Consistencia estructural
+    if tipo == 'impulse' and len(pat['points']) >= 5:
+        conf *= 1.15  # Impulsos completos con 5 puntos
+    
+    # 4. Nivel de onda (mayor confianza para ondas mayores)
+    wave_level_boost = {
+        "Primary": 1.3,
+        "Intermediate": 1.2,
+        "Minor": 1.1,
+        "Minute": 1.0
+    }
+    conf *= wave_level_boost.get(pat['wave_level'], 1.0)
+    
+    # 5. Presencia de objetivos de precio
+    if pat['price_targets']:
+        conf *= 1.1
+    
+    # Limitar entre 0.1 y 1.0 (10% a 100%)
+    return max(0.1, min(1.0, conf))
+
+def calculate_risk_reward(pat, current_price):
+    stop_loss = None
+    risk = None
+    reward = None
+    rr_ratio = None
+    
+    if 'bullish' in pat['type']:
+        # Stop loss en mínimo de subonda 4 o B
+        if len(pat['points']) >= 4:
+            stop_loss = min(p[1] for p in pat['points'][-4:-2])
+        elif len(pat['points']) >= 2:
+            stop_loss = pat['points'][-2][1]
+        if stop_loss and stop_loss > current_price:
+            stop_loss = current_price * 0.98
+        
+        if stop_loss and pat['price_targets'] and pat['price_targets'][0]:
+            risk = abs(current_price - stop_loss)
+            reward = abs(pat['price_targets'][0] - current_price)
+            if risk > 0:
+                rr_ratio = round(reward / risk, 2)
+    
+    elif 'bearish' in pat['type']:
+        # Stop loss en máximo de subonda 4 o B
+        if len(pat['points']) >= 4:
+            stop_loss = max(p[1] for p in pat['points'][-4:-2])
+        elif len(pat['points']) >= 2:
+            stop_loss = pat['points'][-2][1]
+        if stop_loss and stop_loss < current_price:
+            stop_loss = current_price * 1.02
+        
+        if stop_loss and pat['price_targets'] and pat['price_targets'][0]:
+            risk = abs(stop_loss - current_price)
+            reward = abs(current_price - pat['price_targets'][0])
+            if risk > 0:
+                rr_ratio = round(reward / risk, 2)
+    
+    return stop_loss, risk, reward, rr_ratio
+
+# =============================================================================
+# FUNCIÓN DE FORMATO EXCEL ACTUALIZADA
+# =============================================================================
+def apply_excel_formatting(excel_file, confianza_minima):
+    try:
+        wb = openpyxl.load_workbook(excel_file)
+        ws = wb.active
+        
+        # Encontrar columna "Target 1"
+        target1_col_idx = None
+        for idx, cell in enumerate(ws[1], 1):
+            if cell.value and "target 1" in str(cell.value).lower():
+                target1_col_idx = idx
+                break
+                
+        if not target1_col_idx:
+            print("Columna 'Target 1' no encontrada")
+            return
+            
+        # Identificar valores duplicados
+        value_counts = {}
+        duplicated_values = set()
+        
+        for row in range(2, ws.max_row + 1):
+            cell = ws.cell(row=row, column=target1_col_idx)
+            if cell.value is not None:
+                try:
+                    value = round(float(cell.value), 5)
+                    cell.value = value
+                    value_counts[value] = value_counts.get(value, 0) + 1
+                    if value_counts[value] > 1:
+                        duplicated_values.add(value)
+                except (ValueError, TypeError):
+                    pass
+        
+        # Asignar colores distintos para valores duplicados
+        color_palette = [
+            "#FFCCCB", "#90EE90", "#ADD8E6", "#FFD700", "#DDA0DD", 
+            "#87CEFA", "#98FB98", "#FFB6C1", "#20B2AA", "#FFA07A", 
+            "#9370DB", "#3CB371", "#FF6347", "#40E0D0", "#DA70D6", "#F0E68C"
+        ]
+        colors = {}
+        for i, value in enumerate(duplicated_values):
+            color_idx = i % len(color_palette)
+            colors[value] = color_palette[color_idx]
+        
+        # Aplicar colores
+        for row in range(2, ws.max_row + 1):
+            cell = ws.cell(row=row, column=target1_col_idx)
+            if cell.value is not None:
+                try:
+                    value = round(float(cell.value), 5)
+                    if value in duplicated_values:
+                        fill = PatternFill(
+                            start_color=colors[value][1:],
+                            end_color=colors[value][1:],
+                            fill_type="solid"
+                        )
+                        for col in range(1, ws.max_column + 1):
+                            ws.cell(row=row, column=col).fill = fill
+                except (ValueError, TypeError):
+                    pass
+        
+        # Encabezados en negrita
+        header_font = Font(bold=True)
+        for col in range(1, ws.max_column + 1):
+            ws.cell(row=1, column=col).font = header_font
+        
+        # Crear hoja de leyenda
+        if "Leyenda" not in wb.sheetnames:
+            wb.create_sheet("Leyenda")
+        legend_sheet = wb["Leyenda"]
+        
+        # CORRECCIÓN: Usar "Dirección" en lugar de "Último ZigZag válido"
+        columnas_leyenda = [
+            "Color",
+            "Frecuencia",
+            "Símbolos Asociados",
+            "Precio Actual",
+            "Valor en Target 1",
+            "Precio proyectado (ZZ1)",
+            "Precio proyectado (ZZ2)",
+            "Dirección (ZZ1)",  # CAMBIO: Dirección en lugar de último zigzag
+            "Dirección (ZZ2)"   # CAMBIO: Dirección en lugar de último zigzag
+        ]
+        legend_sheet.append(columnas_leyenda)
+        
+        # Buscar índices de columnas necesarias
+        symbol_col_idx = None
+        precio_actual_col_idx = None
+        proy_zz1_col_idx = None
+        proy_zz2_col_idx = None
+        dir_zz1_col_idx = None  # Para dirección ZZ1
+        dir_zz2_col_idx = None  # Para dirección ZZ2
+        
+        # Lista de todas las columnas para referencia
+        all_columns = [cell.value for cell in ws[1]]
+        
+        # Buscar columnas con nombres aproximados - ACTUALIZADO
+        for idx, cell in enumerate(ws[1], 1):
+            header = str(cell.value).lower() if cell.value else ""
+            
+            if not header:
+                continue
+                
+            if "símbolo" in header:
+                symbol_col_idx = idx
+            elif "precio actual" in header:
+                precio_actual_col_idx = idx
+            elif "proyectado" in header and "zz1" in header:
+                proy_zz1_col_idx = idx
+            elif "proyectado" in header and "zz2" in header:
+                proy_zz2_col_idx = idx
+            # CORRECCIÓN: Buscar columnas de dirección
+            elif "dirección" in header and "zz1" in header:
+                dir_zz1_col_idx = idx
+            elif "dirección" in header and "zz2" in header:
+                dir_zz2_col_idx = idx
+        
+        # Verificar que tenemos al menos las columnas esenciales
+        if None in [symbol_col_idx, target1_col_idx]:
+            print("Advertencia: Columnas esenciales no encontradas para la leyenda")
+            print(f"Columnas disponibles: {all_columns}")
+            wb.save(excel_file)
+            return
+            
+        # Agrupar datos por valor de Target 1
+        symbol_groups = {}
+        current_price_groups = {}
+        proy_zz1_groups = {}
+        proy_zz2_groups = {}
+        dir_zz1_groups = {}  # Grupos para dirección ZZ1
+        dir_zz2_groups = {}  # Grupos para dirección ZZ2
+        
+        for row in range(2, ws.max_row + 1):
+            value_cell = ws.cell(row=row, column=target1_col_idx)
+            if value_cell.value is not None:
+                try:
+                    value = round(float(value_cell.value), 5)
+                    if value in duplicated_values:
+                        # Obtener símbolo
+                        symbol_cell = ws.cell(row=row, column=symbol_col_idx)
+                        symbol = symbol_cell.value if symbol_cell.value else ""
+                        
+                        # Obtener precio actual
+                        current_price = "N/A"
+                        if precio_actual_col_idx:
+                            current_price_cell = ws.cell(row=row, column=precio_actual_col_idx)
+                            current_price = current_price_cell.value if current_price_cell.value else "N/A"
+                        
+                        # Obtener precios proyectados
+                        proy_zz1 = "N/A"
+                        if proy_zz1_col_idx:
+                            proy_zz1_cell = ws.cell(row=row, column=proy_zz1_col_idx)
+                            proy_zz1 = proy_zz1_cell.value if proy_zz1_cell.value else "N/A"
+                        
+                        proy_zz2 = "N/A"
+                        if proy_zz2_col_idx:
+                            proy_zz2_cell = ws.cell(row=row, column=proy_zz2_col_idx)
+                            proy_zz2 = proy_zz2_cell.value if proy_zz2_cell.value else "N/A"
+                        
+                        # CORRECCIÓN: Obtener direcciones en lugar de últimos zigzags
+                        dir_zz1 = "N/A"
+                        if dir_zz1_col_idx:
+                            dir_zz1_cell = ws.cell(row=row, column=dir_zz1_col_idx)
+                            dir_zz1 = dir_zz1_cell.value if dir_zz1_cell.value else "N/A"
+                        
+                        dir_zz2 = "N/A"
+                        if dir_zz2_col_idx:
+                            dir_zz2_cell = ws.cell(row=row, column=dir_zz2_col_idx)
+                            dir_zz2 = dir_zz2_cell.value if dir_zz2_cell.value else "N/A"
+                        
+                        if value not in symbol_groups:
+                            symbol_groups[value] = set()
+                            current_price_groups[value] = []
+                            proy_zz1_groups[value] = []
+                            proy_zz2_groups[value] = []
+                            dir_zz1_groups[value] = []  # Para dirección ZZ1
+                            dir_zz2_groups[value] = []  # Para dirección ZZ2
+                        
+                        symbol_groups[value].add(symbol)
+                        current_price_groups[value].append(current_price)
+                        proy_zz1_groups[value].append(proy_zz1)
+                        proy_zz2_groups[value].append(proy_zz2)
+                        dir_zz1_groups[value].append(dir_zz1)  # Almacenar dirección
+                        dir_zz2_groups[value].append(dir_zz2)  # Almacenar dirección
+                except (ValueError, TypeError) as e:
+                    print(f"Error procesando fila {row}: {e}")
+                    continue
+        
+        # Ordenar valores numéricamente
+        sorted_values = sorted(duplicated_values)
+        
+        for value in sorted_values:
+            symbols = ", ".join(symbol_groups.get(value, set()))
+            current_prices = ", ".join([
+                f"{p:.6f}" if isinstance(p, (int, float)) else str(p) 
+                for p in current_price_groups.get(value, [])
+            ])
+            proy_zz1_list = ", ".join([
+                f"{p:.6f}" if isinstance(p, (int, float)) else str(p) 
+                for p in proy_zz1_groups.get(value, [])
+            ])
+            proy_zz2_list = ", ".join([
+                f"{p:.6f}" if isinstance(p, (int, float)) else str(p) 
+                for p in proy_zz2_groups.get(value, [])
+            ])
+            # CORRECCIÓN: Usar direcciones en lugar de últimos zigzags
+            dir_zz1_list = ", ".join(dir_zz1_groups.get(value, []))
+            dir_zz2_list = ", ".join(dir_zz2_groups.get(value, []))
+            
+            legend_sheet.append([
+                "",  # Celda de color (se llenará después)
+                value_counts.get(value, 0),
+                symbols,
+                current_prices,
+                value,
+                proy_zz1_list,
+                proy_zz2_list,
+                dir_zz1_list,  # Dirección ZZ1
+                dir_zz2_list   # Dirección ZZ2
+            ])
+            
+            # Aplicar color a la celda de la columna "Color"
+            cell = legend_sheet.cell(row=legend_sheet.max_row, column=1)
+            if value in colors:
+                cell.fill = PatternFill(
+                    start_color=colors[value][1:],
+                    end_color=colors[value][1:],
+                    fill_type="solid"
+                )
+        
+        # Formato y autoajuste de columnas
+        for col in range(1, legend_sheet.max_column + 1):
+            col_letter = get_column_letter(col)
+            legend_sheet.column_dimensions[col_letter].width = 20
+            legend_sheet.cell(row=1, column=col).font = Font(bold=True)
+        
+        wb.save(excel_file)
+        print("¡Formato de Excel aplicado correctamente!")
+        
+    except ImportError:
+        print("Error: Para aplicar formato, instala openpyxl: pip install openpyxl")
+    except Exception as e:
+        print(f"Error aplicando formato Excel: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+def analisis_zigzag(df, config, is_log_scale=False):
+    """
+    Realiza análisis ZigZag completo con proyecciones corregidas
+    """
+    # Hacemos una copia para no modificar el DataFrame original
+    df_temp = df.copy()
+    
+    # Obtener precio actual
+    current_price = df_temp['close'].iloc[-1]
+    
+    # Obtener índice actual (última vela)
+    current_index = df_temp.index[-1]
+    
+    # Resultados para ambas ventanas
+    zz_results = []
+    for window in config['windows']:
+        # Obtener puntos zigzag
+        señales = puntos_zigzag_mayores(df_temp, window=window)
+        
+        # Calcular proyecciones
+        proyecciones = proyectar_siguiente_zigzag(
+            señales, 
+            current_index, 
+            df_temp,
+            window_size=window,
+            current_price=current_price,
+            is_log_scale=is_log_scale
+        ) if len(señales) >= 2 else {'primary': None, 'secondary': None}
+        
+        # Detectar niveles S/R
+        niveles_sr_zz = detectar_sr_zigzag(señales, tolerancia=config['tolerancia'])
+        niveles_sr_cong = detectar_sr_congestion(df_temp, sensibilidad=config['sensibilidad'])
+        niveles_sr = sorted(niveles_sr_zz + niveles_sr_cong)
+        
+        # Manejo de señales vacías
+        if señales:
+            ultimo_tipo = señales[-1][0]
+            ultimo_idx_int = señales[-1][1]  # Índice entero del DataFrame
+            ultimo_valor = señales[-1][2]
+            
+            # Obtener fecha real usando el índice entero
+            ultimo_fecha = df_temp.loc[ultimo_idx_int, 'datetime']
+            ultimo_zigzag = f"{ultimo_tipo} {ultimo_valor:.3f} @ {ultimo_fecha}"
+        else:
+            ultimo_tipo = None
+            ultimo_valor = None
+            ultimo_zigzag = "N/A"
+        
+        # Convertir todos los puntos a fechas usando índices enteros
+        puntos_zz_fechas = []
+        if señales:
+            for punto in señales:
+                tipo, idx_int, valor = punto
+                fecha = df_temp.loc[idx_int, 'datetime']
+                puntos_zz_fechas.append((tipo, fecha, valor))
+        
+        zz_results.append({
+            'proyeccion_primaria': proyecciones['primary'],
+            'proyeccion_secundaria': proyecciones['secondary'],
+            'ultimo_zigzag': ultimo_zigzag,
+            'ultimo_tipo': ultimo_tipo,
+            'ultimo_valor': ultimo_valor,
+            'puntos_zz': puntos_zz_fechas
+        })
+    
+    return zz_results
+
+# =============================================================================
+# Función principal
+# =============================================================================
+if __name__ == "__main__":
+    print("Iniciando análisis avanzado de Ondas de Elliott y ZigZag...")
+    
+    # Obtener preferencia de escala
+    scale_type = get_scale_preference()
+    
+    # Obtener configuración del usuario
+    wave_level, incluir_menores = get_wave_level()
+    
+    # Configuración de dos ZigZags
+    config_zigzag = menu_parametros_zigzag()
+    
+    start_date, end_date = get_date_range()
+    confianza_minima = get_confidence_level()
+    
+    # Generar timestamp único
+    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M")
+    
+    csv_files = glob.glob("*.csv")
+    
+    if not csv_files:
+        print("No se encontraron archivos CSV")
+        exit()
+    
+    # Preparar datos para Excel
+    excel_data = []
+    column_names = [
+        'Archivo',
+        'Símbolo',
+        '% de la subonda',
+        'Subonda Actual',
+        'Nivel Onda',
+        'Tipo Onda',
+        'Patrón Detectado',
+        'Último ZigZag (ZZ2)',
+        'Último ZigZag (ZZ1)',
+        'Dirección (ZZ2)',
+        'Dirección (ZZ1)',
+        'Precio Actual',
+        'Target 1',
+        'Precio proyectado (ZZ2_1)',
+        'Precio proyectado (ZZ1_1)',
+        'Precio proyectado (ZZ1_2)',
+        'Precio proyectado (ZZ2_2)',
+        'Nivel S/R cercano (ZZ2)',
+        'Nivel S/R cercano (ZZ1)',
+        'Target 2',
+        'Target 3',
+        'Precio (ZZ1)',
+        'Precio (ZZ2)',
+        'Confirmación Volumen',
+        'Confianza',
+        'Stop Loss',
+        'Riesgo',
+        'Recompensa',
+        'Ratio Riesgo/Recompensa',
+        'Análisis Clave'
+    ]
+    
+    for file in csv_files:
+        print(f"\nProcesando: {file}")
+        try:
+            # Leer y preparar datos
+            df = pd.read_csv(file)
+            df = standardize_dataframe(df)
+            
+            # Aplicar transformación de escala
+            df_processed = apply_scale_transformation(df, scale_type)
+            is_log_scale = scale_type == "log"
+            
+            # Verificar datos suficientes
+            if len(df_processed) < 100:
+                print(f"Insuficientes datos ({len(df_processed)} registros). Se requieren al menos 100.")
+                continue
+                
+            # Realizar análisis ZigZag para ambas ventanas
+            zz_results = analisis_zigzag(df_processed, config_zigzag, is_log_scale)
+            
+            # Detectar ondas de Elliott con subniveles
+            print(f"Analizando con nivel principal: {wave_level}")
+            patterns = detect_elliott_waves(df_processed, wave_level, incluir_menores, is_log_scale=is_log_scale)
+            print(f"Detectados {len(patterns)} patrones de Elliott")
+            
+            if patterns:
+                # Crear nombre base
+                base_name = os.path.splitext(os.path.basename(file))[0]
+                file_name = f"{base_name}_{timestamp_str}"
+                
+                # Visualizar con rango de fechas
+                print("Generando gráfico de subondas...")
+                plot_recent_waves(
+                    df_processed, 
+                    patterns, 
+                    zz_results[0]['puntos_zz'], 
+                    zz_results[1]['puntos_zz'],
+                    file_name, 
+                    wave_level, 
+                    start_date, 
+                    end_date, 
+                    is_log_scale=is_log_scale
+                )
+                
+                # Recopilar datos para Excel
+                current_price = df['close'].iloc[-1]  # Precio actual REAL
+                symbol = base_name
+                
+                for pat in patterns:
+                    # Filtrar solo ondas en formación
+                    if pat['progress'] >= 100:
+                        continue
+                    
+                    # Filtrar solo ondas recientes
+                    last_point_idx = pat['points'][-1][0]
+                    if last_point_idx < len(df) - 30:  # Últimos 30 periodos
+                        continue
+                    
+                    # Determinar categoría de onda
+                    if 'impulse' in pat['type']:
+                        wave_type = "Impulso"
+                    elif 'correction' in pat['type']:
+                        wave_type = "Corrección"
+                    elif 'triangle' in pat['type']:
+                        wave_type = "Triángulo"
+                    else:
+                        wave_type = "Desconocido"
+                    
+                    # Calcular confianza
+                    confidence = calculate_confidence(pat)
+                    
+                    # FILTRADO POR CONFIANZA
+                    min_confidence_threshold = {
+                        'impulse': confianza_minima,
+                        'correction': confianza_minima * 0.9,
+                        'triangle': confianza_minima * 0.8
+                    }
+                    
+                    # Determinar tipo para el umbral
+                    if 'impulse' in pat['type']:
+                        threshold = min_confidence_threshold['impulse']
+                    elif 'correction' in pat['type']:
+                        threshold = min_confidence_threshold['correction']
+                    else:
+                        threshold = min_confidence_threshold['triangle']
+                    
+                    if confidence < threshold:
+                        continue
+                    
+                    # Calcular riesgo/recompensa
+                    stop_loss, risk, reward, rr_ratio = calculate_risk_reward(pat, current_price)
+                    
+                    # Convertir targets a precios reales
+                    real_targets = []
+                    for target in pat['price_targets']:
+                        if target is not None:
+                            if is_log_scale:
+                                real_targets.append(reverse_log_values(target))
+                            else:
+                                real_targets.append(target)
+                        else:
+                            real_targets.append(None)
+                    
+                    # Rellenar targets faltantes
+                    while len(real_targets) < 3:
+                        real_targets.append(None)
+                    
+                    # Procesar ambos ZigZags con manejo robusto de errores
+                    zz_data = []
+                    for i, zz_result in enumerate(zz_results):
+                        # Manejar casos donde no hay datos de ZigZag
+                        if not zz_result:
+                            zz_data.append({
+                                'ultimo_zigzag': "N/A",
+                                'direccion': "N/A",
+                                'precio': None,
+                                'proyeccion_primaria': None,
+                                'proyeccion_secundaria': None,
+                                'sr': None,
+                            })
+                            continue
+                            
+                        # Para cada ZigZag (ZZ1 y ZZ2)
+                        proy_primaria = zz_result.get('proyeccion_primaria', None)
+                        proy_secundaria = zz_result.get('proyeccion_secundaria', None)
+                        ultimo_zigzag_str = zz_result.get('ultimo_zigzag', "N/A")
+                        ultimo_tipo = zz_result.get('ultimo_tipo', "N/A")
+                        ultimo_precio = zz_result.get('ultimo_valor', None)
+                        
+                        # Manejar caso cuando no hay zigzag detectado
+                        if ultimo_zigzag_str == "N/A" or ultimo_precio is None:
+                            zz_data.append({
+                                'ultimo_zigzag': "N/A",
+                                'direccion': "N/A",
+                                'precio': None,
+                                'proyeccion_primaria': None,
+                                'proyeccion_secundaria': None,
+                                'sr': None,
+                            })
+                            continue
+                        
+                        if is_log_scale:
+                            # Convertir valores numéricos
+                            if proy_primaria and proy_primaria[2] is not None:
+                                proy_primaria = (proy_primaria[0], proy_primaria[1], reverse_log_values(proy_primaria[2]))
+                            if proy_secundaria and proy_secundaria[2] is not None:
+                                proy_secundaria = (proy_secundaria[0], proy_secundaria[1], reverse_log_values(proy_secundaria[2]))
+                            if ultimo_precio is not None:
+                                ultimo_precio = reverse_log_values(ultimo_precio)
+                            
+                            # Convertir cadena de último zigzag
+                            try:
+                                partes = ultimo_zigzag_str.split(' @ ')
+                                tipo_valor = partes[0].split()[0] if len(partes) > 0 else "N/A"
+                                
+                                # Reconstruir cadena con valor convertido
+                                nuevo_valor_str = f"{tipo_valor} {ultimo_precio:.6f}"
+                                if len(partes) > 1:
+                                    ultimo_zigzag_str = f"{nuevo_valor_str} @ {partes[1]}"
+                                else:
+                                    ultimo_zigzag_str = nuevo_valor_str
+                            except Exception as e:
+                                print(f"Error convirtiendo ZigZag: {str(e)}")
+                                # Mantener valor original si falla la conversión
+                        
+                        zz_data.append({
+                            'ultimo_zigzag': ultimo_zigzag_str,
+                            'direccion': ultimo_tipo,
+                            'precio': ultimo_precio,
+                            'proyeccion_primaria': proy_primaria[2] if proy_primaria else None,
+                            'proyeccion_secundaria': proy_secundaria[2] if proy_secundaria else None,
+                        })
+                    
+                    # Análisis clave con subondas (incluye ZZ1 y ZZ2)
+                    direccion = "Indeterminada"
+                    nivel_clave = 0.0
+                    if pat['points']:
+                        if 'bullish' in pat['type']:
+                            direccion = "Alcista"
+                            # Encontrar máximo real
+                            max_val = -float('inf')
+                            for p in pat['points']:
+                                val = p[1]
+                                if is_log_scale:
+                                    val = reverse_log_values(val)
+                                if val > max_val:
+                                    max_val = val
+                            nivel_clave = max_val
+                        else:
+                            direccion = "Bajista"
+                            # Encontrar mínimo real
+                            min_val = float('inf')
+                            for p in pat['points']:
+                                val = p[1]
+                                if is_log_scale:
+                                    val = reverse_log_values(val)
+                                if val < min_val:
+                                    min_val = val
+                            nivel_clave = min_val
+                    
+                    # MANEJO SEGURO DE VALORES NULOS EN ZIGZAG
+                    try:
+                        precio_zz1 = f"{zz_data[0]['precio']:.6f}" if zz_data[0]['precio'] is not None else "N/A"
+                    except (IndexError, KeyError, TypeError):
+                        precio_zz1 = "N/A"
+                    
+                    try:
+                        precio_zz2 = f"{zz_data[1]['precio']:.6f}" if zz_data[1]['precio'] is not None else "N/A"
+                    except (IndexError, KeyError, TypeError):
+                        precio_zz2 = "N/A"
+                    
+                    # Obtener direcciones con manejo de errores
+                    try:
+                        dir_zz1 = zz_data[0]['direccion'] if len(zz_data) > 0 and zz_data[0]['direccion'] is not None else 'N/A'
+                    except (IndexError, KeyError):
+                        dir_zz1 = "N/A"
+                    
+                    try:
+                        dir_zz2 = zz_data[1]['direccion'] if len(zz_data) > 1 and zz_data[1]['direccion'] is not None else 'N/A'
+                    except (IndexError, KeyError):
+                        dir_zz2 = "N/A"
+                    
+                    comentario = (
+                        f"Tendencia: {direccion} | "
+                        f"Nivel clave: {nivel_clave:.6f} | "
+                        f"Subonda actual: {pat['current_wave']} | "
+                        f"Progreso: {pat['progress']:.0f}% | "
+                        f"ZZ1: {dir_zz1}@{precio_zz1}, "
+                        f"ZZ2: {dir_zz2}@{precio_zz2}"
+                    )
+                    
+                    # Añadir fila a los datos de Excel - ORDEN SOLICITADO
+                    row_data = {
+                        'Archivo': file,
+                        'Símbolo': symbol,
+                        '% de la subonda': pat['progress'],
+                        'Subonda Actual': pat['current_wave'],
+                        'Nivel Onda': pat['wave_level'],
+                        'Tipo Onda': wave_type,
+                        'Patrón Detectado': pat['type'],
+                        'Último ZigZag (ZZ2)': zz_data[1]['ultimo_zigzag'] if len(zz_data) > 1 else "N/A",
+                        'Último ZigZag (ZZ1)': zz_data[0]['ultimo_zigzag'] if len(zz_data) > 0 else "N/A",
+                        'Dirección (ZZ2)': dir_zz2,
+                        'Dirección (ZZ1)': dir_zz1,
+                        'Precio Actual': current_price,
+                        'Target 1': real_targets[0],
+                        'Precio proyectado (ZZ2_1)': zz_data[1]['proyeccion_primaria'] if len(zz_data) > 1 else None,
+                        'Precio proyectado (ZZ1_1)': zz_data[0]['proyeccion_primaria'] if len(zz_data) > 0 else None,
+                        'Precio proyectado (ZZ1_2)': zz_data[0]['proyeccion_secundaria'] if len(zz_data) > 0 else None,
+                        'Precio proyectado (ZZ2_2)': zz_data[1]['proyeccion_secundaria'] if len(zz_data) > 1 else None,
+                        'Nivel S/R cercano (ZZ2)': None,  # Placeholder para futura implementación
+                        'Nivel S/R cercano (ZZ1)': None,  # Placeholder para futura implementación
+                        'Target 2': real_targets[1],
+                        'Target 3': real_targets[2],
+                        'Precio (ZZ1)': zz_data[0]['precio'] if len(zz_data) > 0 and zz_data[0]['precio'] is not None else None,
+                        'Precio (ZZ2)': zz_data[1]['precio'] if len(zz_data) > 1 and zz_data[1]['precio'] is not None else None,
+                        'Confirmación Volumen': pat['volume_confirmation'],
+                        'Confianza': f"{confidence:.0%}",
+                        'Stop Loss': stop_loss,
+                        'Riesgo': risk,
+                        'Recompensa': reward,
+                        'Ratio Riesgo/Recompensa': rr_ratio,
+                        'Análisis Clave': comentario
+                    }
+                    
+                    excel_data.append(row_data)
+        
+        except Exception as e:
+            print(f"Error procesando {file}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+    
+    # CREAR ARCHIVO EXCEL
+    if excel_data:
+        # Crear DataFrame con todas las columnas definidas
+        df_excel = pd.DataFrame(excel_data, columns=column_names)
+        
+        # Ordenar por símbolo y confianza
+        df_excel = df_excel.sort_values(by=['Símbolo', 'Confianza'], ascending=[True, False])
+        
+        # Formatear columnas numéricas
+        numeric_cols = [
+            'Precio (ZZ1)', 'Precio (ZZ2)', 'Precio Actual', 
+            'Target 1', 'Target 2', 'Target 3', 
+            'Precio proyectado (ZZ2_1)', 'Precio proyectado (ZZ1_1)', 
+            'Precio proyectado (ZZ1_2)', 'Precio proyectado (ZZ2_2)',
+            'Stop Loss', 'Riesgo', 'Recompensa'
+        ]
+        
+        for col in numeric_cols:
+            if col in df_excel.columns:
+                # Convertir a numérico y redondear
+                df_excel[col] = pd.to_numeric(df_excel[col], errors='coerce')
+                df_excel[col] = df_excel[col].apply(lambda x: round(x, 5) if not pd.isna(x) else x)
+        
+        # Guardar en Excel
+        excel_file = f"Tablas/{wave_level}_{timestamp_str}_2velas.xlsx"
+        
+        # Crear directorio si no existe
+        os.makedirs("Tablas", exist_ok=True)
+        
+        # Crear Excel con múltiples hojas
+        with pd.ExcelWriter(excel_file, engine='openpyxl') as writer:
+            # Hoja principal con todos los resultados
+            df_excel.to_excel(writer, sheet_name='Resultados', index=False)
+            
+            # Hoja resumen con los mejores patrones por símbolo (FILTRADA POR DIRECCIÓN)
+            if not df_excel.empty:
+                # Función para validar dirección
+                def validar_direccion(row):
+                    patron = row['Patrón Detectado']
+                    zz1_dir = row['Dirección (ZZ1)']
+                    zz2_dir = row['Dirección (ZZ2)']
+                    
+                    if 'bullish' in patron.lower():
+                        # Para alcistas: ambos ZigZags deben ser mínimos
+                        return zz1_dir == 'min' and zz2_dir == 'min'
+                    elif 'bearish' in patron.lower():
+                        # Para bajistas: ambos ZigZags deben ser máximos
+                        return zz1_dir == 'max' and zz2_dir == 'max'
+                    return False
+                
+                best_patterns = df_excel.sort_values('Confianza', ascending=False)
+                best_patterns = best_patterns.drop_duplicates('Símbolo')
+                
+                # Aplicar filtro de dirección
+                mask = best_patterns.apply(validar_direccion, axis=1)
+                best_patterns_filtrados = best_patterns[mask]
+                
+                best_patterns_filtrados.to_excel(writer, sheet_name='Mejores Patrones', index=False)
+            
+            # Hoja con niveles clave (usando ZZ1)
+            if not df_excel.empty:
+                levels = df_excel[['Símbolo', 'Nivel S/R cercano (ZZ1)', 'Precio Actual']].copy()
+                levels.columns = ['Símbolo', 'Nivel S/R cercano', 'Precio Actual']
+                levels = levels.dropna(subset=['Nivel S/R cercano'])
+                if not levels.empty:
+                    levels.to_excel(writer, sheet_name='Niveles Clave', index=False)
+                    
+            # Hoja de configuración
+            config_df = pd.DataFrame({
+                'Parámetro': [
+                    'Escala', 'Nivel de onda', 'Incluir subniveles', 
+                    'Tamaño ventana ZigZag 1', 'Tamaño ventana ZigZag 2',
+                    'Tolerancia S/R', 'Sensibilidad congestión', 'Confianza mínima'
+                ],
+                'Valor': [
+                    scale_type, wave_level, str(incluir_menores),
+                    config_zigzag['windows'][0], config_zigzag['windows'][1],
+                    config_zigzag['tolerancia'], config_zigzag['sensibilidad'], 
+                    f"{confianza_minima:.0%}"
+                ]
+            })
+            config_df.to_excel(writer, sheet_name='Configuración', index=False)
+        
+        print(f"\nExcel generado correctamente: {excel_file}")
+        
+        # Aplicar formato avanzado al Excel
+        apply_excel_formatting(excel_file, confianza_minima)
+    else:
+        print("\nNo se encontraron patrones válidos para exportar a Excel.")
+    
+    print("\nProceso completado con éxito!")
